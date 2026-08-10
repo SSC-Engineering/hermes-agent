@@ -9,6 +9,16 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+SIGNOFF_MD = {
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+    "cost_usd": 0.001,
+    "cost_status": "estimated",
+    "pricing_source": "test",
+    "llm_model": "test/model",
+    "signature_md": "test-signoff",
+}
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -97,6 +107,7 @@ def test_complete_bel_with_summary_tag_succeeds(kanban_home):
             conn,
             tid,
             summary="UNBLOCKED: parent left blocked, live pid verified",
+            metadata=dict(SIGNOFF_MD),
         )
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "done"
@@ -113,7 +124,7 @@ def test_complete_bel_with_metadata_tag_succeeds(kanban_home):
             conn,
             tid,
             summary="park stands",
-            metadata={"disposition": "TRUE_BLOCK"},
+            metadata={**SIGNOFF_MD, "disposition": "TRUE_BLOCK"},
         )
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "done"
@@ -124,6 +135,11 @@ def test_complete_non_bel_without_tag_still_works(kanban_home):
         tid = kb.create_task(
             conn, title="ordinary work item", assignee="rhea-ramos"
         )
-        assert kb.complete_task(conn, tid, summary="done without disposition")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="done without disposition",
+            metadata=dict(SIGNOFF_MD),
+        )
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "done"

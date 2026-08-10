@@ -687,6 +687,23 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"summary/result or metadata.disposition. {disp_err} "
                     f"Task is still in-flight (no state change). Retry with a tag."
                 )
+            except kb.MissingLedgerSignoffError as sign_err:
+                return tool_error(
+                    f"kanban_complete blocked: ledger sign-off required before "
+                    f"done (identity + tokens + cost_usd). Missing: "
+                    f"{', '.join(sign_err.missing_fields)}. "
+                    f"Task is still in-flight (no state change). "
+                    f"Retry after session usage is recorded, or pass "
+                    f"metadata with prompt_tokens/completion_tokens/cost_usd/"
+                    f"llm_model/signature_md."
+                )
+            except kb.LedgerSignoffFailedError as led_err:
+                return tool_error(
+                    f"kanban_complete blocked: action_ledger close failed — "
+                    f"{led_err.reason}. Task is still in-flight (no state "
+                    f"change). Fix ledger connectivity/credentials and retry "
+                    f"kanban_complete with the same handoff."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

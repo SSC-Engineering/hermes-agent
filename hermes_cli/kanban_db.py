@@ -288,27 +288,327 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
         _log.debug("action_ledger open failed for %s: %s", task_id, exc)
 
 
-def _best_effort_action_ledger_close(
+def _action_ledger_configured() -> bool:
+    """True when Supabase service-role credentials are available for ledger I/O."""
+    try:
+        from hermes_cli.action_ledger import ActionLedgerError, _service_config
+    except Exception:
+        return False
+    try:
+        _service_config()
+        return True
+    except ActionLedgerError:
+        return False
+    except Exception:
+        return False
+
+
+def _load_session_usage_row(session_id: Optional[str]) -> Optional[dict]:
+    """Read token/cost fields from the active profile SessionDB, if present."""
+    if not session_id or not str(session_id).strip():
+        return None
+    try:
+        from hermes_state import SessionDB
+    except Exception as exc:  # pragma: no cover
+        _log.debug("session usage import failed: %s", exc)
+        return None
+    try:
+        db = SessionDB()
+        try:
+            row = db.get_session(str(session_id).strip())
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+        return dict(row) if row else None
+    except Exception as exc:
+        _log.debug("session usage lookup failed for %s: %s", session_id, exc)
+        return None
+
+
+def _enrich_completion_signoff_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+) -> dict:
+    """Fill tokens/cost/signature from session + known rate cards before close.
+
+    HEL-4131: completion must carry a priced, signed receipt. Prefer explicit
+    metadata, then session usage, then ``agent.usage_pricing`` rate cards.
+    """
+    md: dict = dict(metadata) if isinstance(metadata, dict) else {}
+    task = get_task(conn, task_id)
+    session_id = md.get("session_id") or (
+        getattr(task, "session_id", None) if task else None
+    )
+    usage = _load_session_usage_row(
+        session_id if isinstance(session_id, str) else None
+    )
+
+    def _as_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if usage:
+        if md.get("prompt_tokens") is None:
+            pt = _as_int(usage.get("input_tokens"))
+            if pt is not None:
+                md["prompt_tokens"] = pt
+        if md.get("completion_tokens") is None:
+            ct = _as_int(usage.get("output_tokens"))
+            if ct is not None:
+                md["completion_tokens"] = ct
+        if not md.get("llm_model") and usage.get("model"):
+            md["llm_model"] = str(usage.get("model"))
+        if md.get("billing_provider") is None and usage.get("billing_provider"):
+            md["billing_provider"] = usage.get("billing_provider")
+        if md.get("billing_base_url") is None and usage.get("billing_base_url"):
+            md["billing_base_url"] = usage.get("billing_base_url")
+        if md.get("cost_usd") is None:
+            actual = _as_float(usage.get("actual_cost_usd"))
+            estimated = _as_float(usage.get("estimated_cost_usd"))
+            if actual is not None:
+                md["cost_usd"] = actual
+                md.setdefault("cost_status", usage.get("cost_status") or "actual")
+                md.setdefault(
+                    "pricing_source", usage.get("cost_source") or "session"
+                )
+            elif estimated is not None:
+                md["cost_usd"] = estimated
+                md.setdefault(
+                    "cost_status", usage.get("cost_status") or "estimated"
+                )
+                md.setdefault(
+                    "pricing_source", usage.get("cost_source") or "session"
+                )
+
+    # Rate-card fill when session did not price the run.
+    if md.get("cost_usd") is None and md.get("llm_model"):
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+            prompt_n = _as_int(md.get("prompt_tokens")) or 0
+            completion_n = _as_int(md.get("completion_tokens")) or 0
+            cost_result = estimate_usage_cost(
+                str(md["llm_model"]),
+                CanonicalUsage(
+                    input_tokens=prompt_n, output_tokens=completion_n
+                ),
+                provider=md.get("billing_provider"),
+                base_url=md.get("billing_base_url"),
+            )
+            if cost_result.amount_usd is not None:
+                md["cost_usd"] = float(cost_result.amount_usd)
+                md.setdefault("cost_status", cost_result.status)
+                md.setdefault("pricing_source", cost_result.source)
+            elif cost_result.status in ("included", "unknown"):
+                md["cost_usd"] = 0.0
+                md.setdefault("cost_status", cost_result.status)
+                md.setdefault("pricing_source", cost_result.source or "none")
+        except Exception as exc:  # pragma: no cover
+            _log.debug("usage_pricing estimate failed for %s: %s", task_id, exc)
+
+    if (
+        not md.get("llm_model")
+        and task is not None
+        and getattr(task, "model_override", None)
+    ):
+        md["llm_model"] = str(task.model_override)
+
+    if not str(md.get("signature_md") or "").strip():
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or "default"
+        except Exception:
+            profile = os.environ.get("HERMES_PROFILE") or "default"
+        agent_name = (
+            (task.assignee if task and task.assignee else None)
+            or profile
+            or "unknown"
+        )
+        linear_id = ""
+        if task is not None:
+            linear_id = getattr(task, "linear_issue_id", None) or ""
+            if not linear_id:
+                try:
+                    linear_id = (
+                        resolve_task_linear_issue_id(
+                            conn, task_id, persist=False
+                        )
+                        or ""
+                    )
+                except Exception:
+                    linear_id = ""
+        linear_id = linear_id or md.get("linear_issue_id") or "n/a"
+        prose = (summary if summary is not None else result) or ""
+        prose_line = (
+            prose.strip().splitlines()[0][:240] if prose.strip() else ""
+        )
+        md["signature_md"] = "\n".join(
+            [
+                f"Agent: {agent_name}",
+                f"Profile/credential: {profile}",
+                f"Linear: {linear_id}",
+                f"Model: {md.get('llm_model') or 'unknown'}",
+                (
+                    f"Tokens: prompt={md.get('prompt_tokens')} "
+                    f"completion={md.get('completion_tokens')}"
+                ),
+                (
+                    f"Cost: usd={md.get('cost_usd')} "
+                    f"status={md.get('cost_status') or 'n/a'} "
+                    f"source={md.get('pricing_source') or 'n/a'}"
+                ),
+                f"Task: {task_id}",
+                *([f"Summary: {prose_line}"] if prose_line else []),
+            ]
+        )
+    return md
+
+
+def _validate_ledger_signoff_or_raise(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> dict:
+    """Fail closed when completion lacks a priced, signed receipt (HEL-4131)."""
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    missing: list[str] = []
+
+    if not str(md.get("signature_md") or "").strip():
+        missing.append("signature_md")
+    if not str(md.get("llm_model") or "").strip():
+        missing.append("llm_model")
+
+    for key in ("prompt_tokens", "completion_tokens"):
+        raw = md.get(key)
+        if raw is None or raw == "":
+            missing.append(key)
+            continue
+        try:
+            if int(raw) < 0:
+                missing.append(key)
+            else:
+                md[key] = int(raw)
+        except (TypeError, ValueError):
+            missing.append(key)
+
+    cost_raw = md.get("cost_usd")
+    if cost_raw is None or cost_raw == "":
+        missing.append("cost_usd")
+    else:
+        try:
+            md["cost_usd"] = float(cost_raw)
+        except (TypeError, ValueError):
+            missing.append("cost_usd")
+
+    status = str(md.get("cost_status") or "").strip().lower()
+    if status:
+        md["cost_status"] = status
+    elif "cost_usd" not in missing:
+        md["cost_status"] = "estimated"
+
+    if missing:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_ledger_signoff",
+                {
+                    "schema_version": 1,
+                    "missing_fields": missing,
+                    "reason": "ledger_signoff_required",
+                },
+            )
+        raise MissingLedgerSignoffError(task_id, missing)
+    return md
+
+
+def _require_action_ledger_close(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> None:
-    """Close the Supabase action_ledger row on complete — never raises."""
-    try:
-        from hermes_cli.action_ledger import close_action_ledger
-    except Exception as exc:  # pragma: no cover
-        _log.debug("action_ledger close import failed: %s", exc)
-        return
-    try:
-        task = get_task(conn, task_id)
-        if task is None:
-            return
+    """Close the action_ledger row with sign-off fields (HEL-4131).
+
+    When Supabase credentials are configured this is **fail-closed**: missing
+    ledger id or close transport failure raises ``LedgerSignoffFailedError``
+    and the caller must not mark the task done. When credentials are absent
+    (dev/test without keys), records a local audit event and returns so unit
+    tests can still exercise the metadata gate.
+    """
+    md = metadata if isinstance(metadata, dict) else {}
+    task = get_task(conn, task_id)
+    if task is None:
+        raise LedgerSignoffFailedError(task_id, "task not found at ledger close")
+
+    configured = _action_ledger_configured()
+    ledger_id = getattr(task, "action_ledger_id", None)
+    if not ledger_id and configured:
+        # Lazy open if claim-path open was skipped/failed.
+        _best_effort_action_ledger_open(conn, task_id)
+        task = get_task(conn, task_id) or task
         ledger_id = getattr(task, "action_ledger_id", None)
-        if not ledger_id:
-            return
-        md = metadata if isinstance(metadata, dict) else {}
+
+    if not configured:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "action_ledger_close_skipped_unconfigured",
+                {
+                    "schema_version": 1,
+                    "reason": "service_role_not_configured",
+                    "had_action_ledger_id": bool(ledger_id),
+                    "cost_usd": md.get("cost_usd"),
+                    "prompt_tokens": md.get("prompt_tokens"),
+                    "completion_tokens": md.get("completion_tokens"),
+                },
+            )
+        return
+
+    if not ledger_id:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_ledger_signoff",
+                {
+                    "schema_version": 1,
+                    "reason": "action_ledger_id_missing",
+                },
+            )
+        raise LedgerSignoffFailedError(
+            task_id,
+            "action_ledger_id missing after open attempt; cannot sign off",
+        )
+
+    try:
+        from hermes_cli.action_ledger import ActionLedgerError, close_action_ledger
+    except Exception as exc:  # pragma: no cover
+        raise LedgerSignoffFailedError(
+            task_id, f"action_ledger import failed: {exc}"
+        ) from exc
+
+    try:
         close_action_ledger(
             ledger_id,
             tools_used=md.get("tools_used"),
@@ -322,13 +622,66 @@ def _best_effort_action_ledger_close(
             outcome="completed",
             signature_md=md.get("signature_md") or summary,
         )
+    except ActionLedgerError as exc:
         with write_txn(conn):
             _append_event(
                 conn,
                 task_id,
-                "action_ledger_closed",
-                {"action_ledger_id": ledger_id, "outcome": "completed"},
+                "completion_blocked_ledger_signoff",
+                {
+                    "schema_version": 1,
+                    "reason": "action_ledger_close_failed",
+                    "action_ledger_id": ledger_id,
+                    "error": str(exc)[:400],
+                },
             )
+        raise LedgerSignoffFailedError(task_id, str(exc)) from exc
+    except Exception as exc:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_ledger_signoff",
+                {
+                    "schema_version": 1,
+                    "reason": "action_ledger_close_failed",
+                    "action_ledger_id": ledger_id,
+                    "error": str(exc)[:400],
+                },
+            )
+        raise LedgerSignoffFailedError(task_id, str(exc)) from exc
+
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "action_ledger_closed",
+            {
+                "action_ledger_id": ledger_id,
+                "outcome": "completed",
+                "cost_usd": md.get("cost_usd"),
+                "prompt_tokens": md.get("prompt_tokens"),
+                "completion_tokens": md.get("completion_tokens"),
+                "cost_status": md.get("cost_status"),
+                "pricing_source": md.get("pricing_source"),
+            },
+        )
+
+
+def _best_effort_action_ledger_close(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Backward-compat wrapper — prefer :func:`_require_action_ledger_close`."""
+    try:
+        _require_action_ledger_close(
+            conn, task_id, summary=summary, metadata=metadata
+        )
+    except LedgerSignoffFailedError as exc:
+        _log.debug("action_ledger close failed for %s: %s", task_id, exc)
     except Exception as exc:
         _log.debug("action_ledger close failed for %s: %s", task_id, exc)
 
@@ -6911,6 +7264,41 @@ class MissingDispositionError(ValueError):
         )
 
 
+class MissingLedgerSignoffError(ValueError):
+    """Raised when complete lacks required action_ledger sign-off fields.
+
+    HEL-4131 — agent cannot finish a claimed task without identity +
+    tokens + cost receipt. Task state is NOT mutated; retry after
+    enrichment or with explicit metadata.
+    """
+
+    def __init__(self, completing_task_id: str, missing_fields: list[str]):
+        self.completing_task_id = completing_task_id
+        self.missing_fields = list(missing_fields)
+        super().__init__(
+            f"completion blocked: task {completing_task_id} missing ledger "
+            f"sign-off fields: {', '.join(self.missing_fields)}. "
+            f"Provide tokens/cost/model (or ensure session usage is recorded) "
+            f"and retry kanban_complete."
+        )
+
+
+class LedgerSignoffFailedError(RuntimeError):
+    """Raised when the Supabase action_ledger close fails under configured keys.
+
+    Completion must not proceed to ``done`` without a durable close of the
+    same action_ledger PK opened at claim.
+    """
+
+    def __init__(self, completing_task_id: str, reason: str):
+        self.completing_task_id = completing_task_id
+        self.reason = reason
+        super().__init__(
+            f"completion blocked: action_ledger sign-off failed for "
+            f"{completing_task_id}: {reason}"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -7071,6 +7459,14 @@ def complete_task(
     raise :class:`MissingDispositionError` without mutating task state
     (closed-loop autonomy substrate / t_0cef6b6e).
 
+    Every completion also requires a ledger sign-off receipt (HEL-4131):
+    ``signature_md``, ``llm_model``, ``prompt_tokens``, ``completion_tokens``,
+    and ``cost_usd`` (auto-filled from session usage + known rate cards when
+    possible). Missing fields raise :class:`MissingLedgerSignoffError`. When
+    Supabase ledger credentials are configured, close of the same
+    ``action_ledger_id`` PK is required or :class:`LedgerSignoffFailedError`
+    is raised — the task cannot reach ``done`` without that sign-off.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -7116,6 +7512,26 @@ def complete_task(
             metadata = {"disposition": bel_disposition}
         elif isinstance(metadata, dict) and "disposition" not in metadata:
             metadata = {**metadata, "disposition": bel_disposition}
+
+    # HEL-4131: enrich + fail-closed ledger sign-off BEFORE any done write.
+    # Auto-fills tokens/$ from session usage and known rate cards; raises
+    # MissingLedgerSignoffError when still incomplete. When Supabase keys
+    # are configured, also requires a durable action_ledger close of the
+    # same PK opened at claim — otherwise LedgerSignoffFailedError.
+    metadata = _enrich_completion_signoff_metadata(
+        conn,
+        task_id,
+        metadata if isinstance(metadata, dict) else None,
+        summary=summary,
+        result=result,
+    )
+    metadata = _validate_ledger_signoff_or_raise(conn, task_id, metadata)
+    _require_action_ledger_close(
+        conn,
+        task_id,
+        summary=(summary if summary is not None else result),
+        metadata=metadata,
+    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -7365,16 +7781,7 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
-    # Best-effort Supabase action_ledger close (HEL-4007). Never blocks complete.
-    try:
-        _best_effort_action_ledger_close(
-            conn,
-            task_id,
-            summary=(summary if summary is not None else result),
-            metadata=metadata if isinstance(metadata, dict) else None,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        _log.debug("action_ledger close after complete failed: %s", exc)
+    # action_ledger close already ran fail-closed before the done write (HEL-4131).
     return True
 
 

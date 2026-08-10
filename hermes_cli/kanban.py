@@ -2395,6 +2395,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"kanban: {disp_err}", file=sys.stderr)
                 continue
+            except kb.MissingLedgerSignoffError as sign_err:
+                failed.append(tid)
+                print(f"kanban: {sign_err}", file=sys.stderr)
+                continue
+            except kb.LedgerSignoffFailedError as led_err:
+                failed.append(tid)
+                print(f"kanban: {led_err}", file=sys.stderr)
+                continue
             except kb.HallucinatedCardsError as hall_err:
                 failed.append(tid)
                 print(f"kanban: {hall_err}", file=sys.stderr)
