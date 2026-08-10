@@ -153,3 +153,90 @@ def test_claim_without_spawn_is_explicitly_incomplete(board):
 
     assert claimed is not None
     assert [event.payload["event_type"] for event in events] == ["task_claimed"]
+
+
+def test_work_intent_stamps_explicit_issue_key_from_body(board):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="implement stamp",
+            body="issue_key: HEL-3990\n\nDo the work.",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        events = _typed_events(conn, task_id)
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert events[0].payload["linear_issue_id"] == "HEL-3990"
+    meta = __import__("json").loads(run["metadata"] or "{}")
+    assert meta.get("linear_issue_id") == "HEL-3990"
+    assert meta.get("linear_issue_source") == "signature"
+
+
+def test_work_intent_title_heuristic_does_not_stamp_signature(board):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="HEL-3990 title only",
+            body="no explicit marker",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        events = _typed_events(conn, task_id)
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert events[0].payload["linear_issue_id"] is None
+    assert run["metadata"] in (None, "{}", "")
+
+
+def test_work_intent_missing_key_is_null_not_sentinel(board):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="no key", assignee="worker")
+        kb.claim_task(conn, task_id, claimer="dispatcher")
+        events = _typed_events(conn, task_id)
+
+    assert events[0].payload["linear_issue_id"] is None
+    assert "UNKNOWN" not in str(events[0].payload["linear_issue_id"])
+    assert events[0].payload["linear_issue_id"] != "unattributed"
+
+
+def test_work_intent_multi_team_keys_from_marker(board):
+    with kb.connect() as conn:
+        for key in ("HEL-3990", "STA-1553", "NEX-633", "SIG-12"):
+            task_id = kb.create_task(
+                conn,
+                title=f"work {key}",
+                body=f"linear_issue_id: {key}",
+                assignee="worker",
+            )
+            claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+            events = _typed_events(conn, task_id)
+            assert events[0].payload["linear_issue_id"] == key
+            assert claimed is not None
+
+
+def test_resolve_linear_issue_stamp_env_and_heuristic_split(board):
+    sig = kb.resolve_linear_issue_stamp(
+        env={"HERMES_LINEAR_ISSUE_ID": "hel-3991"},
+        title="HEL-3990 should not win",
+    )
+    assert sig == {
+        "linear_issue_id": "HEL-3991",
+        "source": "signature",
+        "signature": True,
+    }
+    heur = kb.resolve_linear_issue_stamp(title="feat/HEL-3990-issue-key-stamp")
+    assert heur["linear_issue_id"] == "HEL-3990"
+    assert heur["source"] == "heuristic"
+    assert heur["signature"] is False
+    bare = kb.resolve_linear_issue_stamp(title="nope", body="still nothing")
+    assert bare["linear_issue_id"] is None
+    assert bare["source"] == "unattributed"

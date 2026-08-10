@@ -4811,6 +4811,166 @@ _WORK_INTENT_EVENT_TYPES = frozenset({
 })
 _WORK_INTENT_POLICY_VERSION = "HEL-3110-v1"
 
+# Explicit Linear issue keys only (HEL-3990). Title/body heuristics never promote
+# to signature attribution; missing key stays null (never a sentinel string).
+_LINEAR_ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b")
+_LINEAR_ISSUE_KEY_EXACT_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d+$")
+_EXPLICIT_ISSUE_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"linear[_\s-]?issue(?:[_\s-]?id)?|"
+    r"issue[_\s-]?key|"
+    r"linear[_\s-]?key|"
+    r"tickets?"
+    r")\s*[:=]\s*([^\n]+)$"
+)
+
+
+def normalize_linear_issue_key(value: Optional[str]) -> Optional[str]:
+    """Return a canonical Linear issue key or None.
+
+    Accepts only TEAM-123 shapes (HEL|STA|NEX|SIG and other team prefixes).
+    Never invents a key and never returns a non-null sentinel.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    if _LINEAR_ISSUE_KEY_EXACT_RE.fullmatch(text):
+        return text
+    match = _LINEAR_ISSUE_KEY_RE.search(text)
+    return match.group(1).upper() if match else None
+
+
+def _explicit_issue_keys_from_text(text: Optional[str]) -> list[str]:
+    """Collect issue keys only from explicit marker lines, not free prose."""
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _EXPLICIT_ISSUE_MARKER_RE.finditer(text):
+        for key_match in _LINEAR_ISSUE_KEY_RE.finditer(match.group(1) or ""):
+            key = key_match.group(1).upper()
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+    return found
+
+
+def resolve_linear_issue_stamp(
+    *,
+    explicit: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    branch_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve Linear issue attribution for work-intent / spend paths.
+
+    Precedence for *signature* source:
+      1. explicit argument
+      2. HERMES_LINEAR_ISSUE_ID / HERMES_LINEAR_ISSUE_KEY env
+      3. explicit marker lines in body (``issue_key: HEL-3990``)
+
+    Title and branch names may yield a *heuristic* key only — never
+    ``source=signature``. Missing key → ``linear_issue_id=None``,
+    ``source=unattributed``.
+    """
+    env_map = env if env is not None else os.environ
+    candidates: list[tuple[str, str]] = []
+
+    for raw in (explicit, env_map.get("HERMES_LINEAR_ISSUE_ID"), env_map.get("HERMES_LINEAR_ISSUE_KEY")):
+        key = normalize_linear_issue_key(raw)
+        if key:
+            candidates.append((key, "signature"))
+
+    for key in _explicit_issue_keys_from_text(body):
+        candidates.append((key, "signature"))
+
+    # Heuristic surfaces — attribution only, never signature.
+    for raw in (title, branch_name):
+        key = normalize_linear_issue_key(raw)
+        if key:
+            candidates.append((key, "heuristic"))
+
+    if not candidates:
+        return {
+            "linear_issue_id": None,
+            "source": "unattributed",
+            "signature": False,
+        }
+
+    # Prefer first signature key; otherwise first heuristic.
+    for key, source in candidates:
+        if source == "signature":
+            return {
+                "linear_issue_id": key,
+                "source": "signature",
+                "signature": True,
+            }
+    key, source = candidates[0]
+    return {
+        "linear_issue_id": key,
+        "source": source,
+        "signature": False,
+    }
+
+
+def _resolve_task_linear_issue_stamp(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> dict[str, Any]:
+    """Resolve stamp for a kanban task row (title/body/branch + env)."""
+    row = conn.execute(
+        "SELECT title, body, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return resolve_linear_issue_stamp(env=env)
+    return resolve_linear_issue_stamp(
+        env=env,
+        title=row["title"],
+        body=row["body"],
+        branch_name=row["branch_name"],
+    )
+
+
+def _stamp_run_metadata_linear_issue(
+    conn: sqlite3.Connection,
+    run_id: Optional[int],
+    stamp: Mapping[str, Any],
+) -> None:
+    """Merge linear_issue_id into task_runs.metadata when a run exists."""
+    if run_id is None:
+        return
+    issue = stamp.get("linear_issue_id")
+    if not issue:
+        # Explicit unattributed: do not invent keys; leave metadata alone unless empty.
+        return
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?",
+        (int(run_id),),
+    ).fetchone()
+    if row is None:
+        return
+    meta: dict[str, Any] = {}
+    raw = row["metadata"]
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                meta = parsed
+        except Exception:
+            meta = {}
+    meta["linear_issue_id"] = issue
+    meta["linear_issue_source"] = stamp.get("source") or "unattributed"
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(meta, ensure_ascii=False), int(run_id)),
+    )
+
 
 def _utc_source_time(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace(
@@ -4839,8 +4999,17 @@ def _append_work_intent_event(
         raise ValueError(f"unsupported work-intent event type: {event_type}")
     source_time = occurred_at if occurred_at is not None else time.time()
     task = conn.execute(
-        "SELECT assignee, session_id FROM tasks WHERE id = ?", (task_id,)
+        "SELECT assignee, session_id, title, body, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
+    stamp = resolve_linear_issue_stamp(
+        title=task["title"] if task else None,
+        body=task["body"] if task else None,
+        branch_name=task["branch_name"] if task else None,
+    )
+    # Persist signature stamps on the run so spend_receipt / C2 can join later.
+    if stamp.get("signature"):
+        _stamp_run_metadata_linear_issue(conn, run_id, stamp)
     payload = {
         "event_id": f"evt_{secrets.token_hex(16)}",
         "occurred_at": _utc_source_time(source_time),
@@ -4852,7 +5021,9 @@ def _append_work_intent_event(
         "task_id": task_id,
         "run_id": run_id,
         "session_id": task["session_id"] if task else None,
-        "linear_issue_id": None,
+        # Signature keys only on the governed envelope. Heuristic stays null so
+        # C2 never confuses a title guess with an attributed issue (HEL-3990).
+        "linear_issue_id": stamp["linear_issue_id"] if stamp.get("signature") else None,
         "repo": None,
         "pr_number": None,
         "head_sha": None,
@@ -12036,6 +12207,23 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # HEL-3990: pin explicit Linear issue for spend_receipt / ticket_signature.
+    # Only signature-grade keys are injected; title heuristics stay out of env
+    # so source=signature cannot be claimed from a guessed key.
+    stamp = resolve_linear_issue_stamp(
+        title=task.title,
+        body=task.body,
+        branch_name=task.branch_name,
+        env=env,
+    )
+    if stamp.get("signature") and stamp.get("linear_issue_id"):
+        env["HERMES_LINEAR_ISSUE_ID"] = str(stamp["linear_issue_id"])
+        env["HERMES_LINEAR_ISSUE_SOURCE"] = "signature"
+    else:
+        # Fail-closed for signature path: never leave a stale inherited key.
+        env.pop("HERMES_LINEAR_ISSUE_ID", None)
+        env.pop("HERMES_LINEAR_ISSUE_KEY", None)
+        env["HERMES_LINEAR_ISSUE_SOURCE"] = str(stamp.get("source") or "unattributed")
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
