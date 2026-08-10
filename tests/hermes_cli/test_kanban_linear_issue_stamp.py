@@ -224,3 +224,133 @@ def test_action_ledger_open_failure_does_not_block_claim(board, monkeypatch):
         claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
         assert claimed is not None
         assert claimed.status == "running"
+
+
+def _run_meta(conn, run_id):
+    import json
+
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    return json.loads(row["metadata"] or "{}")
+
+
+def test_unattributed_run_writes_explicit_marker(board):
+    """HEL-3988: no Linear key → linear_issue_id null + source=unattributed."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Routine cleanup with no ticket",
+            body="plain work, nothing to attribute",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        meta = _run_meta(conn, claimed.current_run_id)
+        assert "linear_issue_source" in meta
+        assert meta["linear_issue_source"] == "unattributed"
+        assert meta.get("linear_issue_id") is None
+        # Governed envelope stays null (not a signature key).
+        events = [
+            e
+            for e in kb.list_events(conn, task_id)
+            if e.payload and e.payload.get("event_type") == "task_claimed"
+        ]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        assert events[0].payload["linear_issue_id"] is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.linear_issue_id is None
+
+
+def test_signature_run_metadata_source(board):
+    """Signature body marker stamps run metadata with source=signature."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Signature path stamp",
+            body="issue_key: HEL-3988\n\nDo the work.",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        meta = _run_meta(conn, claimed.current_run_id)
+        assert meta.get("linear_issue_id") == "HEL-3988"
+        assert meta.get("linear_issue_source") == "signature"
+
+
+def test_stamp_does_not_downgrade_signature_to_unattributed(board):
+    """Higher-grade run stamp must not be wiped by a later unattributed write."""
+    import json
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Signature hold",
+            body="Linear: HEL-3988",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        meta_before = _run_meta(conn, run_id)
+        assert meta_before["linear_issue_source"] == "signature"
+        assert meta_before["linear_issue_id"] == "HEL-3988"
+
+        with kb.write_txn(conn):
+            kb._stamp_run_metadata_linear_issue(
+                conn,
+                run_id,
+                {
+                    "linear_issue_id": None,
+                    "source": "unattributed",
+                    "signature": False,
+                },
+            )
+        meta_after = _run_meta(conn, run_id)
+        assert meta_after["linear_issue_source"] == "signature"
+        assert meta_after["linear_issue_id"] == "HEL-3988"
+        # Sanity: metadata still round-trips as JSON object.
+        assert isinstance(json.loads(json.dumps(meta_after)), dict)
+
+
+def test_stamp_does_not_downgrade_heuristic_to_unattributed(board):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Heuristic hold HEL-4008",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        meta_before = _run_meta(conn, run_id)
+        assert meta_before["linear_issue_source"] == "heuristic"
+        assert meta_before["linear_issue_id"] == "HEL-4008"
+
+        with kb.write_txn(conn):
+            kb._stamp_run_metadata_linear_issue(
+                conn,
+                run_id,
+                {
+                    "linear_issue_id": None,
+                    "source": "unattributed",
+                    "signature": False,
+                },
+            )
+        meta_after = _run_meta(conn, run_id)
+        assert meta_after["linear_issue_source"] == "heuristic"
+        assert meta_after["linear_issue_id"] == "HEL-4008"
+
+
+def test_resolve_linear_issue_stamp_unattributed_default():
+    stamp = kb.resolve_linear_issue_stamp(
+        title="no ticket here",
+        body="still nothing",
+        branch_name="fix/cleanup",
+    )
+    assert stamp["linear_issue_id"] is None
+    assert stamp["source"] == "unattributed"
+    assert stamp["signature"] is False
