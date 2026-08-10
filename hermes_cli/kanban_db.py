@@ -4947,13 +4947,18 @@ _WORK_INTENT_POLICY_VERSION = "HEL-3110-v1"
 # to signature attribution; missing key stays null (never a sentinel string).
 _LINEAR_ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b")
 _LINEAR_ISSUE_KEY_EXACT_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d+$")
+# Signature-grade markers only (HEL-3990 / HEL-3988 fleet). Briefs commonly
+# write ``Linear: HEL-3988`` or markdown ``**Linear:** HEL-3988`` — those are
+# intentional attribution, not free-prose title guesses. Bare title/branch
+# matches stay heuristic.
 _EXPLICIT_ISSUE_MARKER_RE = re.compile(
-    r"(?im)^\s*(?:"
+    r"(?im)^\s*(?:\*\*|__)?(?:"
     r"linear[_\s-]?issue(?:[_\s-]?id)?|"
     r"issue[_\s-]?key|"
     r"linear[_\s-]?key|"
-    r"tickets?"
-    r")\s*[:=]\s*([^\n]+)$"
+    r"tickets?|"
+    r"linear"
+    r")(?:\*\*|__)?\s*[:=]\s*([^\n]+)$"
 )
 
 
@@ -5241,9 +5246,22 @@ def _append_work_intent_event(
         body=task["body"] if task else None,
         branch_name=task["branch_name"] if task else None,
     )
-    # Persist signature stamps on the run so spend_receipt / C2 can join later.
-    if stamp.get("signature"):
+    # Always persist a resolved key on the run when we have one so fleet
+    # consumers (spend_receipt join, HEL-3988 AC) can read task_runs.metadata
+    # even for title/branch heuristics. Signature grade still gates the
+    # governed work_intent envelope + HERMES_LINEAR_ISSUE_ID spawn env.
+    if stamp.get("linear_issue_id"):
         _stamp_run_metadata_linear_issue(conn, run_id, stamp)
+    elif stamped:
+        _stamp_run_metadata_linear_issue(
+            conn,
+            run_id,
+            {
+                "linear_issue_id": stamped,
+                "source": "heuristic",
+                "signature": False,
+            },
+        )
     payload = {
         "event_id": f"evt_{secrets.token_hex(16)}",
         "occurred_at": _utc_source_time(source_time),

@@ -66,7 +66,8 @@ def test_work_intent_heuristic_stamps_task_row_not_envelope(board):
 
     Title heuristic must persist linear_issue_id on the task (and feed ledger
     side effects). Governed work_intent payloads only carry signature keys so
-    C2 never treats a title guess as attributed spend.
+    C2 never treats a title guess as attributed spend. Run metadata still
+    carries the heuristic key for fleet join (HEL-3988).
     """
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -89,6 +90,23 @@ def test_work_intent_heuristic_stamps_task_row_not_envelope(board):
         assert task is not None
         # HEL-4008: task row still carries the resolved key for consumers.
         assert task.linear_issue_id == "HEL-4008"
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        meta = __import__("json").loads(run["metadata"] or "{}")
+        assert meta.get("linear_issue_id") == "HEL-4008"
+        assert meta.get("linear_issue_source") == "heuristic"
+
+
+def test_resolve_linear_colon_marker_is_signature():
+    stamp = kb.resolve_linear_issue_stamp(body="**Linear:** HEL-3988\n\nDo work.")
+    assert stamp["linear_issue_id"] == "HEL-3988"
+    assert stamp["source"] == "signature"
+    assert stamp["signature"] is True
+    stamp2 = kb.resolve_linear_issue_stamp(body="Linear: STA-1551 parent")
+    assert stamp2["linear_issue_id"] == "STA-1551"
+    assert stamp2["signature"] is True
 
 
 def test_work_intent_signature_stamps_envelope(board):

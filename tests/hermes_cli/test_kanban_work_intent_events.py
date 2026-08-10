@@ -178,6 +178,7 @@ def test_work_intent_stamps_explicit_issue_key_from_body(board):
 
 
 def test_work_intent_title_heuristic_does_not_stamp_signature(board):
+    """Title heuristic: envelope stays null; run metadata still carries the key."""
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -193,8 +194,35 @@ def test_work_intent_title_heuristic_does_not_stamp_signature(board):
         ).fetchone()
 
     assert claimed is not None
+    # HEL-3990: governed envelope stays signature-only.
     assert events[0].payload["linear_issue_id"] is None
-    assert run["metadata"] in (None, "{}", "")
+    # HEL-3988: task_runs.metadata still gets the resolved key for fleet join.
+    meta = __import__("json").loads(run["metadata"] or "{}")
+    assert meta.get("linear_issue_id") == "HEL-3990"
+    assert meta.get("linear_issue_source") == "heuristic"
+
+
+def test_work_intent_linear_colon_marker_is_signature(board):
+    """Brief-style ``**Linear:** HEL-####`` is signature-grade (HEL-3988)."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="fleet stamp pickup",
+            body="**Linear:** HEL-3988\n\nProve live stamp.",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        events = _typed_events(conn, task_id)
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert events[0].payload["linear_issue_id"] == "HEL-3988"
+    meta = __import__("json").loads(run["metadata"] or "{}")
+    assert meta.get("linear_issue_id") == "HEL-3988"
+    assert meta.get("linear_issue_source") == "signature"
 
 
 def test_work_intent_missing_key_is_null_not_sentinel(board):
