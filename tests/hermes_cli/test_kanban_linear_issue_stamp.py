@@ -61,11 +61,42 @@ def test_create_task_stamps_from_branch_when_title_lacks_key(board):
         assert task.linear_issue_id == "HEL-4009"
 
 
-def test_work_intent_payload_includes_stamped_linear_issue(board):
+def test_work_intent_heuristic_stamps_task_row_not_envelope(board):
+    """HEL-4008 task-row stamp + HEL-3990 signature-only work_intent envelope.
+
+    Title heuristic must persist linear_issue_id on the task (and feed ledger
+    side effects). Governed work_intent payloads only carry signature keys so
+    C2 never treats a title guess as attributed spend.
+    """
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="Lane A HEL-4008 stamp",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        events = [
+            e
+            for e in kb.list_events(conn, task_id)
+            if e.payload and e.payload.get("event_type") == "task_claimed"
+        ]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        # HEL-3990: heuristic title must not populate the governed envelope.
+        assert events[0].payload["linear_issue_id"] is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        # HEL-4008: task row still carries the resolved key for consumers.
+        assert task.linear_issue_id == "HEL-4008"
+
+
+def test_work_intent_signature_stamps_envelope(board):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Lane A signature stamp",
+            body="issue_key: HEL-4008\n\nDo the work.",
             assignee="worker",
         )
         claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
