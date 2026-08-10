@@ -242,6 +242,97 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
+def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> None:
+    """Open a Supabase action_ledger row on claim — never raises."""
+    try:
+        from hermes_cli.action_ledger import open_action_ledger, ActionLedgerError
+    except Exception as exc:  # pragma: no cover - import defensive
+        _log.debug("action_ledger open import failed: %s", exc)
+        return
+    try:
+        task = get_task(conn, task_id)
+        if task is None:
+            return
+        if getattr(task, "action_ledger_id", None):
+            return
+        linear_id = getattr(task, "linear_issue_id", None) or resolve_task_linear_issue_id(
+            conn, task_id, persist=True
+        )
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            agent_name = task.assignee or get_active_profile_name()
+        except Exception:
+            agent_name = task.assignee or "unknown"
+        ledger_id = open_action_ledger(
+            linear_issue_id=linear_id,
+            agent_name=agent_name,
+            credential_id=None,
+            job_title=task.title,
+            kanban_task_id=task_id,
+            session_id=task.session_id,
+        )
+        if ledger_id:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET action_ledger_id = ? WHERE id = ? "
+                    "AND (action_ledger_id IS NULL OR action_ledger_id = '')",
+                    (ledger_id, task_id),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "action_ledger_opened",
+                    {"action_ledger_id": ledger_id, "linear_issue_id": linear_id},
+                )
+    except Exception as exc:
+        _log.debug("action_ledger open failed for %s: %s", task_id, exc)
+
+
+def _best_effort_action_ledger_close(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Close the Supabase action_ledger row on complete — never raises."""
+    try:
+        from hermes_cli.action_ledger import close_action_ledger
+    except Exception as exc:  # pragma: no cover
+        _log.debug("action_ledger close import failed: %s", exc)
+        return
+    try:
+        task = get_task(conn, task_id)
+        if task is None:
+            return
+        ledger_id = getattr(task, "action_ledger_id", None)
+        if not ledger_id:
+            return
+        md = metadata if isinstance(metadata, dict) else {}
+        close_action_ledger(
+            ledger_id,
+            tools_used=md.get("tools_used"),
+            skills_used=md.get("skills_used") or getattr(task, "skills", None),
+            llm_model=md.get("llm_model") or getattr(task, "model_override", None),
+            prompt_tokens=md.get("prompt_tokens"),
+            completion_tokens=md.get("completion_tokens"),
+            cost_usd=md.get("cost_usd"),
+            cost_status=md.get("cost_status"),
+            pricing_source=md.get("pricing_source"),
+            outcome="completed",
+            signature_md=md.get("signature_md") or summary,
+        )
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "action_ledger_closed",
+                {"action_ledger_id": ledger_id, "outcome": "completed"},
+            )
+    except Exception as exc:
+        _log.debug("action_ledger close failed for %s: %s", task_id, exc)
+
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -1232,6 +1323,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional Linear issue key stamped onto the task (HEL-3988 / HEL-4008).
+    linear_issue_id: Optional[str] = None
+    # Supabase action_ledger open-row PK for two-phase open/close.
+    action_ledger_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1320,6 +1415,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            linear_issue_id=(
+                row["linear_issue_id"]
+                if "linear_issue_id" in keys and row["linear_issue_id"]
+                else None
+            ),
+            action_ledger_id=(
+                row["action_ledger_id"]
+                if "action_ledger_id" in keys and row["action_ledger_id"]
+                else None
             ),
         )
 
@@ -1545,7 +1650,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional Linear issue key (e.g. HEL-4009) stamped from title/body/branch/
+    -- workspace/metadata. Read by work_intent events, spend_receipt, and
+    -- ticket_signature without re-parsing free text.
+    linear_issue_id      TEXT,
+    -- Supabase action_ledger row PK opened on claim (HEL-4007/4009).
+    action_ledger_id     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3072,6 +3183,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "linear_issue_id" not in cols:
+        # Optional Linear issue key stamped from title/body/branch/workspace.
+        # Existing rows stay NULL until claim/create paths resolve a key.
+        _add_column_if_missing(
+            conn, "tasks", "linear_issue_id", "linear_issue_id TEXT"
+        )
+
+    if "action_ledger_id" not in cols:
+        # Supabase action_ledger open-row PK. Existing rows stay NULL.
+        _add_column_if_missing(
+            conn, "tasks", "action_ledger_id", "action_ledger_id TEXT"
+        )
+
     # task_links.link_type (HEL-3219): nullable. Existing rows stay NULL and
     # keep hard-dependency semantics. Fresh SCHEMA_SQL already includes the
     # column; this pass upgrades legacy boards that predate it.
@@ -3100,6 +3224,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_linear_issue_id ON tasks(linear_issue_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3901,6 +4028,9 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                linear_issue_id = extract_linear_issue_id(
+                    title, body, branch_name, workspace_path
+                )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3909,8 +4039,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, linear_issue_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3935,6 +4065,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        linear_issue_id,
                     ),
                 )
                 for pid in parents:
@@ -3961,6 +4092,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "linear_issue_id": linear_issue_id,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4978,6 +5110,103 @@ def _utc_source_time(epoch: float) -> str:
     )
 
 
+# Linear issue key as it appears in branch names / ticket references.
+# Matches spend_receipt.ISSUE_PATTERN so stamping and receipts agree.
+_LINEAR_ISSUE_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b")
+_LINEAR_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b(?:linear|issue|ticket|hel)\s*[:#]?\s*([A-Z][A-Z0-9]{1,9}-\d+)\b"
+)
+
+
+def extract_linear_issue_id(*texts: Optional[str]) -> Optional[str]:
+    """Parse a Linear key (e.g. HEL-4009) from free text.
+
+    Prefer an explicit ``Linear:`` / ``issue:`` / ``ticket:`` context when
+    multiple keys are present; otherwise prefer the first ``HEL-`` key, then
+    the first match overall. Returns None when nothing matches.
+    """
+    candidates: list[str] = []
+    contextual: list[str] = []
+    for raw in texts:
+        if not raw:
+            continue
+        text = str(raw)
+        for match in _LINEAR_CONTEXT_PATTERN.finditer(text):
+            key = match.group(1).upper()
+            if key not in contextual:
+                contextual.append(key)
+        for match in _LINEAR_ISSUE_PATTERN.finditer(text):
+            key = match.group(1).upper()
+            if key not in candidates:
+                candidates.append(key)
+    if not candidates and not contextual:
+        return None
+    pool = contextual or candidates
+    for key in pool:
+        if key.startswith("HEL-"):
+            return key
+    return pool[0]
+
+
+def resolve_task_linear_issue_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    persist: bool = True,
+) -> Optional[str]:
+    """Resolve and optionally persist ``tasks.linear_issue_id``.
+
+    Resolution order:
+      1. explicit metadata key (``linear_issue_id`` / ``linear_issue`` / ``issue``)
+      2. already-persisted task column
+      3. parse title, body, branch_name, workspace_path
+    """
+    explicit: Optional[str] = None
+    if isinstance(metadata, dict):
+        for key in ("linear_issue_id", "linear_issue", "issue", "ticket"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                explicit = extract_linear_issue_id(value.strip()) or value.strip().upper()
+                break
+    row = conn.execute(
+        "SELECT title, body, branch_name, workspace_path, linear_issue_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return explicit
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    existing = None
+    if "linear_issue_id" in keys and row["linear_issue_id"]:
+        existing = str(row["linear_issue_id"]).strip() or None
+    resolved = explicit or existing or extract_linear_issue_id(
+        row["title"] if "title" in keys else None,
+        row["body"] if "body" in keys else None,
+        row["branch_name"] if "branch_name" in keys else None,
+        row["workspace_path"] if "workspace_path" in keys else None,
+    )
+    if (
+        persist
+        and resolved
+        and resolved != existing
+        and "linear_issue_id" in keys
+    ):
+        conn.execute(
+            "UPDATE tasks SET linear_issue_id = ? WHERE id = ?",
+            (resolved, task_id),
+        )
+    return resolved
+
+
+def get_task_linear_issue_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Public export: Linear key for a task without re-parsing free text when stamped."""
+    return resolve_task_linear_issue_id(conn, task_id, persist=False)
+
+
 def _append_work_intent_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4993,13 +5222,18 @@ def _append_work_intent_event(
     actor_id: str = "kanban-dispatcher",
     causation_event_id: Optional[str] = None,
     occurred_at: Optional[float] = None,
+    linear_issue_id: Optional[str] = None,
 ) -> None:
     """Append one minimized, replay-safe dispatcher lifecycle event."""
     if event_type not in _WORK_INTENT_EVENT_TYPES:
         raise ValueError(f"unsupported work-intent event type: {event_type}")
     source_time = occurred_at if occurred_at is not None else time.time()
+    # Stamp Linear key onto the task row when missing so subsequent events
+    # and external consumers (spend_receipt / ticket_signature) can read it.
+    stamped = linear_issue_id or resolve_task_linear_issue_id(conn, task_id, persist=True)
     task = conn.execute(
-        "SELECT assignee, session_id, title, body, branch_name FROM tasks WHERE id = ?",
+        "SELECT assignee, session_id, title, body, branch_name, linear_issue_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     stamp = resolve_linear_issue_stamp(
@@ -5023,6 +5257,7 @@ def _append_work_intent_event(
         "session_id": task["session_id"] if task else None,
         # Signature keys only on the governed envelope. Heuristic stays null so
         # C2 never confuses a title guess with an attributed issue (HEL-3990).
+        # resolve_task_linear_issue_id still persists task-row stamps + ledger side effects.
         "linear_issue_id": stamp["linear_issue_id"] if stamp.get("signature") else None,
         "repo": None,
         "pr_number": None,
@@ -6111,6 +6346,12 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
+    # Best-effort Supabase action_ledger open (HEL-4007). Never blocks claim.
+    try:
+        _best_effort_action_ledger_open(conn, task_id)
+        claimed = get_task(conn, task_id) or claimed
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("action_ledger open after claim failed: %s", exc)
     return claimed
 
 
@@ -7124,6 +7365,16 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    # Best-effort Supabase action_ledger close (HEL-4007). Never blocks complete.
+    try:
+        _best_effort_action_ledger_close(
+            conn,
+            task_id,
+            summary=(summary if summary is not None else result),
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("action_ledger close after complete failed: %s", exc)
     return True
 
 
