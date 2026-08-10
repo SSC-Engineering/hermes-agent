@@ -5074,18 +5074,37 @@ def _resolve_task_linear_issue_stamp(
     )
 
 
+# Higher grade wins; never downgrade signature/heuristic → unattributed.
+_LINEAR_ISSUE_SOURCE_RANK = {
+    "signature": 3,
+    "heuristic": 2,
+    "unattributed": 1,
+}
+
+
 def _stamp_run_metadata_linear_issue(
     conn: sqlite3.Connection,
     run_id: Optional[int],
     stamp: Mapping[str, Any],
 ) -> None:
-    """Merge linear_issue_id into task_runs.metadata when a run exists."""
+    """Merge linear attribution into task_runs.metadata when a run exists.
+
+    HEL-3988 AC: every run records a Linear key **or** an explicit
+    ``linear_issue_source=unattributed`` marker. Missing marker is a bug;
+    unattributed is honest. Do not invent keys. Do not overwrite a
+    higher-grade stamp (signature/heuristic with a key) with unattributed.
+    """
     if run_id is None:
         return
-    issue = stamp.get("linear_issue_id")
-    if not issue:
-        # Explicit unattributed: do not invent keys; leave metadata alone unless empty.
-        return
+    issue = stamp.get("linear_issue_id") or None
+    if issue is not None:
+        issue = str(issue).strip() or None
+    source = str(stamp.get("source") or ("unattributed" if not issue else "heuristic"))
+    if source not in _LINEAR_ISSUE_SOURCE_RANK:
+        source = "unattributed" if not issue else "heuristic"
+    # Unattributed must never invent a key.
+    if source == "unattributed":
+        issue = None
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE id = ?",
         (int(run_id),),
@@ -5101,8 +5120,28 @@ def _stamp_run_metadata_linear_issue(
                 meta = parsed
         except Exception:
             meta = {}
-    meta["linear_issue_id"] = issue
-    meta["linear_issue_source"] = stamp.get("source") or "unattributed"
+    existing_source = meta.get("linear_issue_source")
+    existing_issue = meta.get("linear_issue_id")
+    existing_rank = _LINEAR_ISSUE_SOURCE_RANK.get(str(existing_source or ""), 0)
+    new_rank = _LINEAR_ISSUE_SOURCE_RANK.get(source, 0)
+    # Never downgrade a higher-grade stamp already on the run.
+    if existing_rank > new_rank:
+        return
+    # Same grade with an existing key: keep the established key unless the
+    # new stamp also carries a key (allow same-grade key refresh).
+    if (
+        existing_rank == new_rank
+        and existing_rank > 0
+        and existing_issue
+        and not issue
+    ):
+        return
+    if issue:
+        meta["linear_issue_id"] = issue
+    else:
+        # Explicit JSON null — honest unattributed marker (HEL-3988).
+        meta["linear_issue_id"] = None
+    meta["linear_issue_source"] = source
     conn.execute(
         "UPDATE task_runs SET metadata = ? WHERE id = ?",
         (json.dumps(meta, ensure_ascii=False), int(run_id)),
@@ -5246,10 +5285,9 @@ def _append_work_intent_event(
         body=task["body"] if task else None,
         branch_name=task["branch_name"] if task else None,
     )
-    # Always persist a resolved key on the run when we have one so fleet
-    # consumers (spend_receipt join, HEL-3988 AC) can read task_runs.metadata
-    # even for title/branch heuristics. Signature grade still gates the
-    # governed work_intent envelope + HERMES_LINEAR_ISSUE_ID spawn env.
+    # Always stamp run metadata (HEL-3988): signature/heuristic key when
+    # present, else explicit source=unattributed. Signature grade still gates
+    # the governed work_intent envelope + HERMES_LINEAR_ISSUE_ID spawn env.
     if stamp.get("linear_issue_id"):
         _stamp_run_metadata_linear_issue(conn, run_id, stamp)
     elif stamped:
@@ -5259,6 +5297,18 @@ def _append_work_intent_event(
             {
                 "linear_issue_id": stamped,
                 "source": "heuristic",
+                "signature": False,
+            },
+        )
+    else:
+        # No key on title/body/branch and none already on the task row —
+        # still write the honest unattributed marker (AC gap fix).
+        _stamp_run_metadata_linear_issue(
+            conn,
+            run_id,
+            {
+                "linear_issue_id": None,
+                "source": "unattributed",
                 "signature": False,
             },
         )
