@@ -111,6 +111,25 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def _assert_run_metadata_contains(meta, expected: dict) -> None:
+    """Caller-supplied keys must survive; HEL-3988 may add linear stamp keys.
+
+    Unattributed runs stamp ``linear_issue_source=unattributed`` with
+    ``linear_issue_id`` null (or the key may be absent). Do not require
+    exact dict equality against user metadata alone.
+    """
+    assert isinstance(meta, dict)
+    for key, value in expected.items():
+        assert key in meta, f"missing expected metadata key {key!r} in {meta!r}"
+        assert meta[key] == value, f"metadata[{key!r}]={meta[key]!r} != {value!r}"
+    source = meta.get("linear_issue_source")
+    if source is not None:
+        assert source == "unattributed", (
+            f"unexpected linear_issue_source={source!r} without an attributed key"
+        )
+        assert meta.get("linear_issue_id") is None
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({
@@ -127,7 +146,7 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        _assert_run_metadata_contains(run.metadata, {"files": 2})
     finally:
         conn.close()
 
@@ -583,7 +602,9 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        _assert_run_metadata_contains(
+            run.metadata, {"child_task": child_out["task_id"]}
+        )
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
