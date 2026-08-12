@@ -532,7 +532,26 @@ def finalize_kanban_worker_terminal_loop_error(
             # Already terminal (blocked/done/etc). Treat as success so the
             # worker can exit without a bare protocol_violation ghost.
             return out
-        meta = {
+        # Loop-error annotation only. HEL-3988: capture any prior linear stamp
+        # BEFORE block_task — `_end_run` nulls metadata when called without
+        # a metadata dict, so post-block readback would always miss the stamp.
+        prior: dict = {}
+        try:
+            pre_run = latest_run(conn, tid)
+            if pre_run is not None:
+                raw_prior = getattr(pre_run, "metadata", None)
+                if isinstance(raw_prior, str) and raw_prior.strip():
+                    try:
+                        parsed = json.loads(raw_prior)
+                        if isinstance(parsed, dict):
+                            prior = parsed
+                    except Exception:
+                        prior = {}
+                elif isinstance(raw_prior, dict):
+                    prior = dict(raw_prior)
+        except Exception:
+            prior = {}
+        loop_meta = {
             "source": "worker_terminal_loop_error",
             "loop_error": reason,
             "partial": bool(result.get("partial")) if isinstance(result, dict) else None,
@@ -556,9 +575,18 @@ def finalize_kanban_worker_terminal_loop_error(
             return out
         # Annotate the just-ended run so BEL triage sees a loop error, not a
         # bare protocol_violation. block_task ends the run without metadata.
+        # Merge-preserve linear_issue_id / linear_issue_source so terminal
+        # loop-error finalize cannot wipe HEL-3988 attribution (live fleet
+        # residual: 17/124 runs wiped by wholesale metadata replace).
         try:
             run = latest_run(conn, tid)
             if run is not None:
+                meta = dict(prior)
+                meta.update(loop_meta)
+                # Explicit preserve: loop_meta must never null out a better stamp.
+                for stamp_key in ("linear_issue_id", "linear_issue_source"):
+                    if stamp_key in prior and prior[stamp_key] is not None:
+                        meta[stamp_key] = prior[stamp_key]
                 with write_txn(conn):
                     conn.execute(
                         """
