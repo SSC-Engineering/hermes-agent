@@ -1449,3 +1449,30 @@ def _isolate_computer_use_approval_state():
             _cu_tool._session_auto_approve.clear()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _soft_hal_on_kanban_complete(request, monkeypatch):
+    """Default HAL close to no-op so hermetic kanban tests never hit Supabase.
+
+    Production ``complete_task`` now fail-closes on HAL (session cost required).
+    Unit tests create synthetic tasks without service keys / session DBs; without
+    this patch every ``complete_task`` call would raise ActionLedgerCloseError.
+
+    Opt out with ``@pytest.mark.real_hal_gate`` when the test exercises the gate.
+    """
+    if request.node.get_closest_marker("real_hal_gate"):
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception:
+        return
+    monkeypatch.setattr(
+        kb, "_require_action_ledger_close", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(
+        kb, "_best_effort_action_ledger_close", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(
+        kb, "_best_effort_action_ledger_open", lambda *a, **k: None, raising=False
+    )

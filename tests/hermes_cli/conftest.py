@@ -5,6 +5,13 @@ from __future__ import annotations
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_hal_gate: exercise live HAL fail-closed complete (no soft patch)",
+    )
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
