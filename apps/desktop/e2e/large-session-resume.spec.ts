@@ -5,6 +5,7 @@ import { type TestInfo } from '@playwright/test'
 import { expect, test, type ElectronApplication, type Page } from './test'
 
 import {
+  closeElectronApp,
   buildAppEnv,
   createSandbox,
   launchDesktop,
@@ -67,7 +68,7 @@ async function setupSeededDesktop(mockServer?: MockServerOptions): Promise<Seede
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },

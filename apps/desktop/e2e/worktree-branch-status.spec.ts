@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import { test, expect } from './test'
 
 import {
+  closeElectronApp,
   buildAppEnv,
   createSandbox,
   launchDesktop,
@@ -54,7 +55,7 @@ test.beforeAll(async () => {
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },
