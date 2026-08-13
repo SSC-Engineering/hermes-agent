@@ -707,6 +707,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.ActionLedgerCloseError as hal_err:
+                # Fail-closed HAL: task stays in-flight. Worker must pass
+                # session-backed cost (or metadata.allow_zero_cost for true
+                # zero) and retry. Audit event completion_blocked_hal landed.
+                return tool_error(
+                    f"kanban_complete blocked: HAL close required before done. "
+                    f"{hal_err.reason} "
+                    f"Task is still in-flight (no state change). "
+                    f"Retry with metadata.cost_usd from session usage, or "
+                    f"ensure worker_session_id is stamped so cost can be "
+                    f"resolved automatically. Documented true zero only via "
+                    f"metadata.allow_zero_cost=true."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

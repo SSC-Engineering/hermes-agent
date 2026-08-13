@@ -12,6 +12,7 @@ import * as path from 'node:path'
 import { expect, test } from './test'
 
 import {
+  closeElectronApp,
   type MockBackendFixture,
   buildAppEnv,
   createSandbox,
@@ -65,7 +66,7 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },
@@ -119,7 +120,7 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },

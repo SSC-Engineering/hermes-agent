@@ -16,9 +16,10 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
-    # Never hit network from unit tests.
+    # Never hit network from unit tests (also covered by root autouse soft-HAL).
     monkeypatch.setattr(kb, "_best_effort_action_ledger_open", lambda *a, **k: None)
     monkeypatch.setattr(kb, "_best_effort_action_ledger_close", lambda *a, **k: None)
+    monkeypatch.setattr(kb, "_require_action_ledger_close", lambda *a, **k: None)
     kb.init_db()
     return home
 

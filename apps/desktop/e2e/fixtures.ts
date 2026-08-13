@@ -20,7 +20,7 @@
  * Prerequisite: `npm run build` must have been run so that `dist/` exists.
  */
 
-import { spawnSync } from 'node:child_process'
+import { spawnSync, type ChildProcess } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -343,6 +343,102 @@ export async function launchDesktop(
   return { app, page }
 }
 
+
+// ─── Electron teardown ──────────────────────────────────────────────────
+
+/**
+ * Close an ElectronApplication without hanging the Playwright worker.
+ *
+ * Playwright's `app.close()` waits for a graceful process exit. When the
+ * desktop main process (or a backend/grandchild it owns) stalls on quit —
+ * e.g. a held background terminal from E2E_SIDEBAR_CROSS, a stuck before-quit
+ * handler, or a hung `hermes serve` child — that wait never resolves and the
+ * suite dies on the default 90s afterAll timeout (CI 2026-08-13: sidebar-
+ * states, worktree-branch-status, warm-resume-jitter).
+ *
+ * Strategy:
+ *  1. Race a graceful `app.close()` against a short budget (default 8s).
+ *  2. If still alive, SIGKILL the Electron process tree so the worker can
+ *     finish and free the next test.
+ *
+ * Always resolves; never throws. Safe to call twice.
+ */
+export async function closeElectronApp(
+  app: ElectronApplication | null | undefined,
+  timeoutMs = 8_000,
+): Promise<void> {
+  if (!app) {
+    return
+  }
+
+  let proc: ChildProcess | null = null
+  try {
+    proc = app.process()
+  } catch {
+    // App already closed / process handle unavailable.
+  }
+
+  const graceful = app.close().catch(() => undefined)
+
+  let timedOut = false
+  await Promise.race([
+    graceful,
+    new Promise<void>(resolve => {
+      setTimeout(() => {
+        timedOut = true
+        resolve()
+      }, timeoutMs)
+    }),
+  ])
+
+  if (!timedOut) {
+    return
+  }
+
+  // Graceful close hung — force-kill Electron and its descendants (backend
+  // `hermes serve`, ptys, bg terminal children). Best-effort; ignore ESRCH.
+  const pid = proc?.pid
+  if (pid && Number.isInteger(pid) && pid > 0) {
+    try {
+      if (process.platform === 'win32') {
+        spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
+      } else {
+        // Depth-first: kill grandchildren before the parent so reparented
+        // orphans don't outlive the worker (and hold ports / locks).
+        const killTree = (target: number): void => {
+          try {
+            const listed = spawnSync('pgrep', ['-P', String(target)], { encoding: 'utf8' })
+            if (listed.status === 0 && listed.stdout) {
+              for (const line of listed.stdout.split('\n')) {
+                const childPid = Number(line.trim())
+                if (Number.isInteger(childPid) && childPid > 0) {
+                  killTree(childPid)
+                }
+              }
+            }
+          } catch {
+            // pgrep missing or no children.
+          }
+          try {
+            process.kill(target, 'SIGKILL')
+          } catch {
+            // Already gone.
+          }
+        }
+        killTree(pid)
+      }
+    } catch {
+      // Already gone.
+    }
+  }
+
+  // Give Playwright a moment to observe the exit so its internal state settles.
+  await Promise.race([
+    graceful,
+    new Promise<void>(resolve => setTimeout(resolve, 2_000)),
+  ])
+}
+
 // ─── Public fixtures ────────────────────────────────────────────────────
 
 export interface MockBackendFixture {
@@ -404,7 +500,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },
@@ -434,7 +530,7 @@ export async function setupNoProvider(): Promise<NoProviderFixture> {
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       sandbox.cleanup()
     },
   }
@@ -495,7 +591,7 @@ providers:
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       sandbox.cleanup()
     },
   }
@@ -581,7 +677,7 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       sandbox.cleanup()
     },
   }
