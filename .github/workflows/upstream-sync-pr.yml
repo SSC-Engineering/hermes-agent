@@ -43,17 +43,17 @@ jobs:
             "+refs/heads/main:refs/remotes/nous/main"
 
           UPSTREAM_SHA=$(git rev-parse nous/main)
-          BASE_SHA=$(git rev-parse origin/main)
           SHORT=${UPSTREAM_SHA:0:10}
-
-          if [ "$UPSTREAM_SHA" = "$BASE_SHA" ]; then
-            echo "Already at parity with ${UPSTREAM_REPO}@${SHORT}"
-            exit 0
-          fi
-
           BEHIND=$(git rev-list --count origin/main..nous/main)
           AHEAD=$(git rev-list --count nous/main..origin/main)
           echo "fork unique=${AHEAD}  behind_nous=${BEHIND}  nous=${SHORT}"
+
+          # SHA equality is the wrong parity test after a merge commit:
+          # fork main can contain every Nous commit and still differ.
+          if [ "$BEHIND" = "0" ]; then
+            echo "Already at parity with ${UPSTREAM_REPO}@${SHORT}"
+            exit 0
+          fi
 
           # Publish Nous tip as a moving window. Force is intentional: this
           # branch is never unique work, only the upstream snapshot to merge.
@@ -86,7 +86,7 @@ jobs:
           )
 
           EXISTING=$(gh pr list \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --base main \
             --head "$SYNC_BRANCH" \
             --state open \
@@ -102,7 +102,7 @@ jobs:
             echo "Updated existing PR #${EXISTING}"
           else
             gh pr create \
-              --repo "${{ github.repository }}" \
+              --repo "${GITHUB_REPOSITORY}" \
               --base main \
               --head "$SYNC_BRANCH" \
               --title "chore(sync): Nous ${SHORT} (${BEHIND} commits)" \
