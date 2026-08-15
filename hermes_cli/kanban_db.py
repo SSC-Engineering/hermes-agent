@@ -4103,6 +4103,15 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    if parent_link_type is None:
+        try:
+            from hermes_cli.kanban_preflight import _kanban_setting
+
+            configured = _kanban_setting("default_parent_link_type")
+        except Exception:
+            configured = None
+        if configured:
+            parent_link_type = configured
     parent_link_type = _normalize_link_type(parent_link_type)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -6446,13 +6455,26 @@ def recompute_ready(
                 preflight_event
                 and preflight_event["kind"] == "pre_dispatch_validation_failed"
             )
+            revalidate_capability = False
+            try:
+                from hermes_cli.kanban_preflight import _kanban_setting
+
+                revalidate_capability = bool(
+                    _kanban_setting("revalidate_capability_blocks", False)
+                )
+            except Exception:
+                revalidate_capability = False
             if cur_status == "blocked" and (
-                _has_sticky_block(conn, task_id) or preflight_blocked
+                _has_sticky_block(conn, task_id)
+                or (preflight_blocked and not revalidate_capability)
             ):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+                # this predicate back). When
+                # ``kanban.revalidate_capability_blocks`` is true,
+                # preflight capability blocks are re-checked instead of
+                # staying sticky.
                 continue
             parents = conn.execute(
                 "SELECT t.status AS status, l.link_type AS link_type "

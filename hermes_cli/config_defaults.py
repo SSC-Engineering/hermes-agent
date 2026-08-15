@@ -1685,6 +1685,12 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Optional HELIOS-AGENTIC-OS checkout. When set (or via
+        # HELIOS_AGENTIC_OS / HELIOS_REPO), Hermes also scans
+        # HELIos/skills, .cursor/skills, and .agents/skills so those
+        # SKILL.md files become /skill-name commands. Local ~/.hermes/skills
+        # still wins on name collision.
+        "helios_root": "",
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -2225,6 +2231,28 @@ DEFAULT_CONFIG = {
             "todo_promotable_threshold_seconds": None,
             "ready_unclaimed_threshold_seconds": None,
         },
+        # HELIos / multi-agent harness policy. Stock Hermes defaults stay
+        # permissive so a personal install is unchanged. Set these once in
+        # the org-root ~/.hermes/config.yaml (not a per-profile copy and
+        # not a fork patch) when Hermes is a module inside a larger agent
+        # org. Readers HOME-anchor these three keys so a profile session
+        # still sees org policy.
+        #
+        # When true, named profiles with a SOUL.md must declare
+        # CERTIFICATION (binding): `skill-name` or dispatch rejects with
+        # missing_profile_certification. `hermes profile create
+        # --certification <skill>` writes that line at create time.
+        "require_binding_certification": False,
+        # Default ``task_links.link_type`` when ``hermes kanban create
+        # --parent`` omits ``--type``. Empty/unset keeps the stock hard
+        # dependency (NULL / ``depends-on``). Set ``gates`` so children
+        # can promote while a programme parent is still open.
+        "default_parent_link_type": "",
+        # When true, a capability-blocked card is re-validated on each
+        # dispatcher tick after the profile is repaired. Pass → ready
+        # (or todo if parents remain unsatisfied). Stock default is
+        # sticky-block until an explicit unblock.
+        "revalidate_capability_blocks": False,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

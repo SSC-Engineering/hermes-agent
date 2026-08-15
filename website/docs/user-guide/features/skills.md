@@ -336,6 +336,21 @@ Paths support `~` expansion and `${VAR}` environment variable substitution.
 - **Full integration**: External skills appear in the system prompt index, `skills_list`, `skill_view`, and as `/skill-name` slash commands — no different from local skills.
 - **Non-existent paths are silently skipped**: If a configured directory doesn't exist, Hermes ignores it without errors. Useful for optional shared directories that may not be present on every machine.
 
+### HELIos checkout (`helios_root`)
+
+This fork can treat a `HELIOS-AGENTIC-OS` checkout as a first-class skill source. Set `skills.helios_root` (or export `HELIOS_AGENTIC_OS` / `HELIOS_REPO`) to the repo root. Hermes then scans these trees if they exist:
+
+- `HELIos/skills`
+- `.cursor/skills`
+- `.agents/skills`
+
+Those `SKILL.md` files become `/skill-name` commands. Local `~/.hermes/skills/` still wins on name collision. No hardcoded CoWork path — machines without the checkout skip this.
+
+```yaml
+skills:
+  helios_root: /path/to/HELIOS-AGENTIC-OS
+```
+
 ### Example
 
 ```text

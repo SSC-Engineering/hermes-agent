@@ -259,7 +259,7 @@ def _(rid, params: dict) -> dict:
                 ),
             }
             for c in completer.get_completions(doc, None)
-        ][:30]
+        ]
         text_lower = text.lower()
         extras = [
             {

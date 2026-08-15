@@ -790,6 +790,11 @@ skills:
   # external_dirs:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
+  #
+  # HELIOS-AGENTIC-OS checkout. When set (or via HELIOS_AGENTIC_OS /
+  # HELIOS_REPO), Hermes also scans HELIos/skills, .cursor/skills, and
+  # .agents/skills. Those SKILL.md files become /skill-name commands.
+  # helios_root: /path/to/HELIOS-AGENTIC-OS
 
 # =============================================================================
 # Agent Behavior

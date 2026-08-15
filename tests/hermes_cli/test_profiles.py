@@ -151,8 +151,58 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_create_writes_binding_certification(self, profile_env):
+        from hermes_cli.profiles import binding_certifications
 
+        profile_dir = create_profile(
+            "coder",
+            no_alias=True,
+            certifications=["worker-cert"],
+        )
+        assert binding_certifications(profile_dir) == ["worker-cert"]
+        soul = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+        assert "CERTIFICATION (binding):" in soul
+        assert "`worker-cert`" in soul
 
+    def test_require_binding_cert_blocks_uncertified_create(self, profile_env, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"require_binding_certification": True}},
+        )
+        with pytest.raises(ValueError, match="require_binding_certification"):
+            create_profile("coder", no_alias=True)
+        assert not get_profile_dir("coder").exists()
+
+    def test_org_root_require_cert_applies_from_a_profile_session(self, profile_env, monkeypatch):
+        """A Miles/Paul session must still see org-root require_binding_certification."""
+        import yaml
+
+        default_home = Path.home() / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"kanban": {"require_binding_certification": True}}),
+            encoding="utf-8",
+        )
+        miles = default_home / "profiles" / "01-max-headroom"
+        miles.mkdir(parents=True)
+        (miles / "config.yaml").write_text("model: test\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(miles))
+
+        with pytest.raises(ValueError, match="require_binding_certification"):
+            create_profile("coder", no_alias=True)
+        assert not get_profile_dir("coder").exists()
+
+    def test_require_cert_rmtrees_when_binding_write_fails(self, profile_env, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.kanban_preflight._kanban_setting",
+            lambda name, default=None: True if name == "require_binding_certification" else default,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.ensure_binding_certification",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with pytest.raises(OSError, match="disk full"):
+            create_profile("coder", no_alias=True, certifications=["worker-cert"])
+        assert not get_profile_dir("coder").exists()
 
 
 # ===================================================================

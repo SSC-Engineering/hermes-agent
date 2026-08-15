@@ -473,6 +473,17 @@ def _normalize_string_set(values) -> Set[str]:
 # of pure waste).
 _EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
 
+# Canonical skill trees inside a HELIOS-AGENTIC-OS checkout. Local
+# ``~/.hermes/skills`` still wins on name collision; these are the
+# extra roots the fork should scan so HELIos SKILL.md files become
+# ``/skill-name`` commands without a per-skill symlink.
+HELIOS_SKILL_SUBDIRS: Tuple[str, ...] = (
+    "HELIos/skills",
+    ".cursor/skills",
+    ".agents/skills",
+)
+_HELIOS_ROOT_ENV = ("HELIOS_AGENTIC_OS", "HELIOS_REPO")
+
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
@@ -480,12 +491,77 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+def _resolve_configured_skills_dir(entry: str, hermes_home: Path) -> Optional[Path]:
+    """Expand one configured skill-dir entry; return None if it is not a dir."""
+    entry = (entry or "").strip()
+    if not entry:
+        return None
+    expanded = os.path.expanduser(os.path.expandvars(entry))
+    p = Path(expanded)
+    if not p.is_absolute():
+        p = (hermes_home / p).resolve()
+    else:
+        p = p.resolve()
+    if p.is_dir():
+        return p
+    logger.debug("External skills dir does not exist, skipping: %s", p)
+    return None
 
-    Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
-    path.  Only directories that actually exist are returned.  Duplicates and
-    paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
+
+def resolve_helios_root(skills_cfg: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+    """Return the HELIOS-AGENTIC-OS checkout used as a skill source, if any.
+
+    Resolution order:
+      1. ``skills.helios_root`` in config.yaml
+      2. ``HELIOS_AGENTIC_OS`` or ``HELIOS_REPO`` (must exist on disk)
+
+    No hardcoded CoWork path — tests and machines without the repo stay empty.
+    """
+    from hermes_constants import get_hermes_home
+
+    hermes_home = get_hermes_home()
+    if skills_cfg is None:
+        parsed = _load_raw_config() or {}
+        maybe = parsed.get("skills")
+        skills_cfg = maybe if isinstance(maybe, dict) else {}
+    if isinstance(skills_cfg, dict):
+        configured = skills_cfg.get("helios_root")
+        if configured:
+            resolved = _resolve_configured_skills_dir(str(configured), hermes_home)
+            if resolved is not None:
+                return resolved
+    for env_name in _HELIOS_ROOT_ENV:
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            continue
+        resolved = _resolve_configured_skills_dir(raw, hermes_home)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def get_helios_skill_dirs(skills_cfg: Optional[Dict[str, Any]] = None) -> List[Path]:
+    """Expand ``helios_root`` into the HELIos skill trees that exist on disk."""
+    root = resolve_helios_root(skills_cfg)
+    if root is None:
+        return []
+    found: List[Path] = []
+    for rel in HELIOS_SKILL_SUBDIRS:
+        candidate = (root / rel).resolve()
+        if candidate.is_dir():
+            found.append(candidate)
+    return found
+
+
+def get_external_skills_dirs() -> List[Path]:
+    """Read ``skills.external_dirs`` (plus optional HELIos root) and return dirs.
+
+    Each ``external_dirs`` entry is expanded (``~`` and ``${VAR}``) and
+    resolved to an absolute path.  When ``skills.helios_root`` or
+    ``HELIOS_AGENTIC_OS`` / ``HELIOS_REPO`` points at a HELIOS-AGENTIC-OS
+    checkout, the canonical trees (``HELIos/skills``, ``.cursor/skills``,
+    ``.agents/skills``) are appended if they exist.  Duplicates and the
+    local ``~/.hermes/skills/`` directory are skipped.
 
     Cached in-process, keyed on ``config.yaml`` mtime — the function is
     called once per skill during banner / tool-registry scans, and YAML
@@ -493,16 +569,14 @@ def get_external_skills_dirs() -> List[Path]:
     when the cache is absent.
     """
     config_path = get_config_path()
-    if not config_path.exists():
-        return []
-
-    # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
-    # the full YAML parse, so the fast path is nearly free.
+    # Missing config.yaml is still a valid HELIos lookup: env vars alone
+    # can point at HELIOS-AGENTIC-OS. Cache that case as mtime 0 so a
+    # later-created config.yaml (nonzero mtime) invalidates automatically.
     try:
         stat = config_path.stat()
         cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
     except OSError:
-        cache_key = None  # type: ignore[assignment]
+        cache_key = (str(config_path), 0)
 
     if cache_key is not None:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
@@ -510,53 +584,34 @@ def get_external_skills_dirs() -> List[Path]:
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
-    parsed = _load_raw_config()
-    if not parsed:
-        return []
+    parsed = _load_raw_config() or {}
+    skills_cfg = parsed.get("skills") if isinstance(parsed.get("skills"), dict) else {}
 
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
-
-    raw_dirs = skills_cfg.get("external_dirs")
-    if not raw_dirs:
-        result: List[Path] = []
-        if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
-        return result
+    raw_dirs = skills_cfg.get("external_dirs") if skills_cfg else None
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
-        return []
+        raw_dirs = []
 
     from hermes_constants import get_hermes_home
 
     hermes_home = get_hermes_home()
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
-    result = []
+    result: List[Path] = []
 
     for entry in raw_dirs:
-        entry = str(entry).strip()
-        if not entry:
+        p = _resolve_configured_skills_dir(str(entry), hermes_home)
+        if p is None or p == local_skills or p in seen:
             continue
-        # Expand ~ and environment variables
-        expanded = os.path.expanduser(os.path.expandvars(entry))
-        p = Path(expanded)
-        # Resolve relative paths against HERMES_HOME, not cwd
-        if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
-        if p == local_skills:
+        seen.add(p)
+        result.append(p)
+
+    for p in get_helios_skill_dirs(skills_cfg):
+        if p == local_skills or p in seen:
             continue
-        if p in seen:
-            continue
-        if p.is_dir():
-            seen.add(p)
-            result.append(p)
-        else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+        seen.add(p)
+        result.append(p)
 
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)

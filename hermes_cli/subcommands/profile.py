@@ -62,6 +62,16 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
              "Used by the kanban decomposer to route tasks based on role instead "
              "of profile name alone. Skip and add later via `hermes profile describe`.",
     )
+    profile_create.add_argument(
+        "--certification",
+        action="append",
+        default=[],
+        dest="certifications",
+        metavar="SKILL",
+        help="Binding certification skill to declare on SOUL.md "
+             "(repeatable). Required when kanban.require_binding_certification "
+             "is true unless the cloned SOUL already declares one.",
+    )
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from agent.skill_utils import (
-    is_excluded_skill_path,
+    iter_skill_index_files,
     parse_frontmatter,
     skill_matches_platform_list,
 )
@@ -63,26 +63,109 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+# Org-HOME harness keys. Stock Hermes leaves them unset; HELIos sets them
+# once in ``~/.hermes/config.yaml``. Profile sessions must not require a
+# per-seat copy of the same keys — that is a seat patch.
+_HARNESS_POLICY_KEYS = frozenset(
+    {
+        "require_binding_certification",
+        "default_parent_link_type",
+        "revalidate_capability_blocks",
+    }
+)
+
+
+def _org_root_kanban_policy() -> dict[str, Any]:
+    """Read explicit ``kanban.*`` keys from the HOME-anchored org config.
+
+    ``load_config()`` follows ``HERMES_HOME``. A profile session therefore
+    never sees ``~/.hermes/config.yaml``. Harness policy lives at the org
+    root so stock Hermes stays per-profile and HELIos sets the keys once.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        from utils import fast_safe_load
+
+        path = get_default_hermes_root() / "config.yaml"
+        if not path.is_file():
+            return {}
+        data = fast_safe_load(path.read_text(encoding="utf-8")) or {}
+        section = data.get("kanban") if isinstance(data, dict) else None
+        return dict(section) if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _kanban_setting(name: str, default: Any = None) -> Any:
+    """Read one ``kanban.*`` policy key. Missing/unreadable config → *default*.
+
+    Harness keys prefer an explicit org-root value so a profile session
+    cannot silently drop HELIos policy. All other keys stay profile-local.
+    """
+    if name in _HARNESS_POLICY_KEYS:
+        org = _org_root_kanban_policy()
+        if name in org and org[name] is not None:
+            return org[name]
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config().get("kanban") or {}).get(name, default)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _package_is_symlink(path: Path) -> bool:
+    """True when *path* or its parent package directory is a symlink."""
+    try:
+        if path.is_symlink():
+            return True
+        if path.name == "SKILL.md" and path.parent.is_symlink():
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _remember_skill(indexed: dict[str, Path], key: str, candidate: Path) -> None:
+    """Index *candidate* under *key*, preferring a real directory over a symlink.
+
+    First-wins ``setdefault`` hid a later real HAL package behind an earlier
+    symlink dest (HELIos writer seats, 2026-08-13). A real package always
+    replaces a symlink; equal-quality entries keep the first hit.
+    """
+    if not key:
+        return
+    existing = indexed.get(key)
+    if existing is None:
+        indexed[key] = candidate
+        return
+    if _package_is_symlink(existing) and not _package_is_symlink(candidate):
+        indexed[key] = candidate
+
+
 def _profile_skill_files(profile_dir: Path) -> dict[str, Path]:
-    """Index active skill packages by directory and frontmatter name."""
+    """Index active skill packages by directory and frontmatter name.
+
+    Uses the same symlink-following walker as stock Hermes skill discovery
+    (``iter_skill_index_files``) so a dest that is a directory symlink is
+    visible to dispatch the same way ``hermes skills list`` sees it.
+    """
     root = profile_dir / "skills"
     if not root.is_dir():
         return {}
     indexed: dict[str, Path] = {}
     try:
-        candidates = root.rglob("SKILL.md")
-        for skill_file in candidates:
-            if is_excluded_skill_path(skill_file, root=root):
-                continue
+        for skill_file in iter_skill_index_files(root, "SKILL.md"):
             try:
                 raw = skill_file.read_text(encoding="utf-8")
                 frontmatter, _ = parse_frontmatter(raw)
             except (OSError, UnicodeError):
                 frontmatter = {}
-            indexed.setdefault(skill_file.parent.name, skill_file)
+            _remember_skill(indexed, skill_file.parent.name, skill_file)
             declared = str(frontmatter.get("name") or "").strip()
             if declared:
-                indexed.setdefault(declared, skill_file)
+                _remember_skill(indexed, declared, skill_file)
     except OSError:
         return indexed
     return indexed
@@ -94,19 +177,17 @@ def _index_skill_tree(skills_root: Path) -> dict[str, Path]:
         return {}
     indexed: dict[str, Path] = {}
     try:
-        for skill_file in skills_root.rglob("SKILL.md"):
-            if is_excluded_skill_path(skill_file, root=skills_root):
-                continue
+        for skill_file in iter_skill_index_files(skills_root, "SKILL.md"):
             try:
                 raw = skill_file.read_text(encoding="utf-8")
                 frontmatter, _ = parse_frontmatter(raw)
             except (OSError, UnicodeError):
                 frontmatter = {}
             package_dir = skill_file.parent
-            indexed.setdefault(package_dir.name, package_dir)
+            _remember_skill(indexed, package_dir.name, package_dir)
             declared = str(frontmatter.get("name") or "").strip()
             if declared:
-                indexed.setdefault(declared, package_dir)
+                _remember_skill(indexed, declared, package_dir)
     except OSError:
         return indexed
     return indexed
@@ -232,20 +313,41 @@ def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreD
     return None
 
 
+def _remove_path(path: Path) -> None:
+    """Remove a file, symlink, or directory without following a dest symlink.
+
+    ``shutil.rmtree`` on a directory symlink can walk into (and delete) the
+    golden package it points at. Unlink dests first; only rmtree real dirs.
+    """
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return
+    except OSError:
+        pass
+    if path.exists():
+        shutil.rmtree(path)
+
+
 def _install_skill_package(source_package: Path, dest_package: Path) -> None:
-    """Copy *source_package* onto *dest_package* via a sibling staging dir."""
+    """Copy *source_package* onto *dest_package* via a sibling staging dir.
+
+    Materializes a real directory (``symlinks=False``) so the next index
+    pass does not depend on following dest links. Safe when *dest_package*
+    itself is a symlink to a shared golden.
+    """
     dest_package.parent.mkdir(parents=True, exist_ok=True)
     staging = dest_package.parent / f".{dest_package.name}.skill-sync-tmp"
-    if staging.exists():
-        shutil.rmtree(staging)
+    if staging.exists() or staging.is_symlink():
+        _remove_path(staging)
     try:
-        shutil.copytree(source_package, staging)
-        if dest_package.exists():
-            shutil.rmtree(dest_package)
+        shutil.copytree(source_package, staging, symlinks=False)
+        if dest_package.exists() or dest_package.is_symlink():
+            _remove_path(dest_package)
         staging.replace(dest_package)
     finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        if staging.exists() or staging.is_symlink():
+            _remove_path(staging)
 
 
 def _destination_for_canonical(
@@ -332,23 +434,9 @@ def sync_required_skills(
 
 
 def _binding_certifications(profile_dir: Path) -> list[str]:
-    soul = profile_dir / "SOUL.md"
-    if not soul.is_file():
-        return []
-    try:
-        text = soul.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return []
-    certifications: list[str] = []
-    for line in text.splitlines():
-        if "CERTIFICATION (binding):" not in line and "CERTIFICATIONS (binding):" not in line:
-            continue
-        parts = line.split("`")
-        for index in range(1, len(parts), 2):
-            name = parts[index].strip()
-            if name and name not in certifications:
-                certifications.append(name)
-    return certifications
+    from hermes_cli.profiles import binding_certifications
+
+    return binding_certifications(profile_dir)
 
 
 def _skill_frontmatter(skill_file: Path) -> Mapping[str, Any]:
@@ -596,7 +684,13 @@ def validate_dispatch_candidate(
     skills = _profile_skill_files(profile_dir)
     certifications = _binding_certifications(profile_dir)
     soul_path = profile_dir / "SOUL.md"
-    if assignee != "default" and soul_path.is_file() and not certifications:
+    require_cert = bool(_kanban_setting("require_binding_certification", False))
+    if (
+        require_cert
+        and assignee != "default"
+        and soul_path.is_file()
+        and not certifications
+    ):
         return PreDispatchFailure(
             code="missing_profile_certification",
             message=f"Assignee profile {assignee!r} declares no binding certification.",

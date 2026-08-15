@@ -545,10 +545,9 @@ export function desktopSkinSlashCompletions(
  * A–Z within a tie. A `/` menu sorted alphabetically buries the handful of
  * skills someone reaches for daily under a hundred they have never opened.
  *
- * `pruneUnusedBuiltins` additionally drops bundled skills with no recorded
- * activity — the ones that ship with Hermes and were never asked for. It is
- * for BROWSING (a bare `/`) only: typing a query is a search, and a search
- * must never hide a match.
+ * `pruneUnusedBuiltins` can still drop unused bundled skills, but the
+ * desktop `/` popover no longer uses it — every registered skill stays
+ * listed. Typing a query is a search either way and must never hide a match.
  *
  * Older backends send no `skills` map; then nothing is reordered or dropped.
  */

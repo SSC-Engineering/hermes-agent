@@ -30,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -988,6 +988,66 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     return serve
 
 
+def parse_binding_certifications(text: str) -> list[str]:
+    """Extract backtick-delimited skill names from CERTIFICATION (binding) lines."""
+    certifications: list[str] = []
+    for line in text.splitlines():
+        if (
+            "CERTIFICATION (binding):" not in line
+            and "CERTIFICATIONS (binding):" not in line
+        ):
+            continue
+        parts = line.split("`")
+        for index in range(1, len(parts), 2):
+            name = parts[index].strip()
+            if name and name not in certifications:
+                certifications.append(name)
+    return certifications
+
+
+def binding_certifications(profile_dir: Path) -> list[str]:
+    """Return the binding certification skill names declared in ``SOUL.md``."""
+    soul = profile_dir / "SOUL.md"
+    if not soul.is_file():
+        return []
+    try:
+        text = soul.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    return parse_binding_certifications(text)
+
+
+def ensure_binding_certification(
+    profile_dir: Path,
+    certifications: Sequence[str],
+) -> list[str]:
+    """Append a CERTIFICATION (binding) line to ``SOUL.md`` when missing.
+
+    Existing declared names are preserved and extended. Returns the full
+    declared list after the write. Does not invent a certification — the
+    caller must pass at least one name.
+    """
+    names = [str(name).strip() for name in certifications if str(name).strip()]
+    names = list(dict.fromkeys(names))
+    if not names:
+        raise ValueError("at least one certification name is required")
+    existing = binding_certifications(profile_dir)
+    merged = list(dict.fromkeys([*existing, *names]))
+    if existing == merged:
+        return existing
+    soul = profile_dir / "SOUL.md"
+    try:
+        current = soul.read_text(encoding="utf-8") if soul.is_file() else ""
+    except (OSError, UnicodeError):
+        current = ""
+    ticks = " ".join(f"`{name}`" for name in merged)
+    line = f"CERTIFICATION (binding): {ticks}\n"
+    if current and not current.endswith("\n"):
+        current += "\n"
+    soul.write_text(current + line, encoding="utf-8")
+    return merged
+
+
 def create_profile(
     name: str,
     clone_from: Optional[str] = None,
@@ -996,6 +1056,7 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
+    certifications: Optional[Sequence[str]] = None,
 ) -> Path:
     """Create a new profile directory.
 
@@ -1056,6 +1117,23 @@ def create_profile(
             raise FileNotFoundError(
                 f"Source profile '{clone_from or 'active'}' does not exist at {source_dir}"
             )
+
+    require_cert = False
+    try:
+        from hermes_cli.kanban_preflight import _kanban_setting
+
+        require_cert = bool(_kanban_setting("require_binding_certification", False))
+    except Exception:
+        require_cert = False
+    requested_certs = [
+        str(name).strip() for name in (certifications or []) if str(name).strip()
+    ]
+    inherited_certs = binding_certifications(source_dir) if source_dir is not None else []
+    if require_cert and not requested_certs and not inherited_certs:
+        raise ValueError(
+            "kanban.require_binding_certification is true; pass "
+            "--certification <skill> or clone a SOUL that already declares one."
+        )
 
     if clone_all and source_dir:
         # Full copy of source profile (exclude sibling ~/.hermes/profiles/)
@@ -1169,6 +1247,17 @@ def create_profile(
             )
         except Exception:
             pass  # non-fatal — user can describe later with `hermes profile describe`
+
+    if certifications:
+        try:
+            ensure_binding_certification(profile_dir, certifications)
+            from hermes_cli.kanban_preflight import sync_required_skills
+
+            sync_required_skills(profile_dir, list(certifications))
+        except Exception:
+            if require_cert:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                raise
 
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so

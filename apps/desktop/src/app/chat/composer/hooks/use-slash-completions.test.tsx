@@ -120,14 +120,15 @@ describe('useSlashCompletions', () => {
   })
 
   // An alphabetical `/` menu buries the skills someone runs daily under the
-  // ones that shipped with Hermes and were never opened.
-  it('orders skills by use and hides never-used built-ins on a bare slash', async () => {
+  // ones that shipped with Hermes and were never opened. Rank by use, but
+  // keep every registered skill visible — unused bundled ones stay listed.
+  it('orders skills by use and keeps unused built-ins on a bare slash', async () => {
     const request = vi.fn().mockResolvedValue(RANKED_CATALOG)
     const api = harness({ request } as unknown as HermesGateway)
 
     const skills = commandsOf((await completions(api, '')).filter(isSkillItem))
 
-    expect(skills).toEqual(['/work', '/research', '/docx'])
+    expect(skills).toEqual(['/work', '/research', '/docx', '/research-paper-writing'])
   })
 
   // Typing is a search, and a search that hides a match is broken — the

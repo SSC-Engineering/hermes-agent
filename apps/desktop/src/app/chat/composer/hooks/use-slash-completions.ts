@@ -176,9 +176,9 @@ export function useSlashCompletions(options: {
           }
 
           // Browsing, not searching: rank the skills the user actually reaches
-          // for to the top and drop never-used built-ins entirely. Typing a
-          // query takes the other branch, where nothing is hidden.
-          items.push(...rankSkillCommands(skillRows, catalog.skills, { pruneUnusedBuiltins: true }))
+          // for to the top. Every registered skill stays in the list — unused
+          // bundled ones used to be pruned, which hid most of a large library.
+          items.push(...rankSkillCommands(skillRows, catalog.skills))
 
           return { items, query }
         }

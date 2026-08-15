@@ -333,6 +333,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument(
+        "--type",
+        dest="parent_link_type",
+        choices=["depends-on", "gates"],
+        default=None,
+        help=(
+            "Link type for --parent edges (HEL-3219). Default is the "
+            "kanban.default_parent_link_type config value, or a hard "
+            "dependency when unset. 'gates' allows the child to promote "
+            "while the parent is blocked or running."
+        ),
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -1616,6 +1628,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 tenant=args.tenant,
                 priority=args.priority,
                 parents=tuple(args.parent or ()),
+                parent_link_type=getattr(args, "parent_link_type", None),
                 triage=bool(getattr(args, "triage", False)),
                 idempotency_key=getattr(args, "idempotency_key", None),
                 max_runtime_seconds=max_runtime,
