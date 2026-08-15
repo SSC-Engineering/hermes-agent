@@ -220,11 +220,19 @@ def test_late_completion_after_gave_up_is_explicit_recovery(
         assert recovery[0].payload["reason"] == "late_completion"
         assert recovery[0].payload["from_outcome"] == "gave_up"
         assert recovery[0].payload["to_outcome"] == "completed"
-        assert _event_kinds(conn, task_id)[-3:] == [
+        # HEL-3123: complete_task writes current_step_key after recovered+completed.
+        # Drop optional HAL bookkeeping so the recovery contract stays isolated.
+        kinds = [
+            kind for kind in _event_kinds(conn, task_id)
+            if kind not in {"action_ledger_opened", "action_ledger_closed"}
+        ]
+        assert kinds[-4:] == [
             "gave_up",
             "recovered",
             "completed",
+            "step_transitioned",
         ]
+        assert _task(conn, task_id).current_step_key == "release"
         assert _latest_run(conn, task_id).id == run_id
         assert _latest_run(conn, task_id).outcome == "completed"
 
@@ -300,8 +308,14 @@ def test_late_completion_through_worker_tool_recovers_exact_gave_up_run(
 
     with kb.connect() as conn:
         assert _task(conn, task_id).status == "done"
-        assert _event_kinds(conn, task_id)[-3:] == [
+        kinds = [
+            kind for kind in _event_kinds(conn, task_id)
+            if kind not in {"action_ledger_opened", "action_ledger_closed"}
+        ]
+        assert kinds[-4:] == [
             "gave_up",
             "recovered",
             "completed",
+            "step_transitioned",
         ]
+        assert _task(conn, task_id).current_step_key == "release"

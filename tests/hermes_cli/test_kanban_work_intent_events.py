@@ -70,7 +70,7 @@ def test_successful_work_intent_is_reconstructable_from_typed_events(board):
     assert events[-1].payload["to_state"] == "completed"
     assert events[-1].payload["reason_code"] == "completed"
     assert final_task is not None
-    assert final_task.current_step_key is None
+    assert final_task.current_step_key == "release"
 
     required = {
         "event_id", "occurred_at", "recorded_at", "event_type",
