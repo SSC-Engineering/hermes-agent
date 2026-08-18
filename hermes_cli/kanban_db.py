@@ -5195,7 +5195,7 @@ def _write_current_step_key(
 
     Must run inside the caller's open write txn, in the same commit as the
     underlying status mutation. Maps status via
-    :func:`hermes_cli.kanban.stage_mapping.map_task_state_to_stage`, updates
+    :func:`hermes_cli.kanban_stage_mapping.map_task_state_to_stage`, updates
     the column only when the stage actually changes, and emits a
     ``step_transitioned`` event whose ``idempotency_key`` is derived from the
     underlying mutation (never a free-standing synthetic key).
