@@ -15,6 +15,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 
 import {
+  closeElectronApp,
   buildAppEnv,
   createSandbox,
   launchDesktop,
@@ -82,7 +83,7 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },

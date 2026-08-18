@@ -1,8 +1,10 @@
-"""Tests for hermes_cli.action_ledger open/close client."""
+"""Tests for hermes_cli.action_ledger open/close client + cost gate."""
 
 from __future__ import annotations
 
 import json
+import sqlite3
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -82,11 +84,105 @@ def test_close_action_ledger_patches_same_id(monkeypatch):
     assert calls[0]["body"]["status"] == "closed"
     assert calls[0]["body"]["tools_used"] == ["terminal"]
     assert calls[0]["body"]["prompt_tokens"] == 10
+    assert calls[0]["body"]["cost_usd"] == 0.01
 
 
 def test_close_requires_ledger_id():
     with pytest.raises(al.ActionLedgerError):
         al.close_action_ledger("")
+
+
+def test_close_completed_without_cost_refuses(monkeypatch):
+    def fake_request(method, path, body=None, prefer=None, extra_headers=None):
+        raise AssertionError("must not PATCH when cost missing")
+
+    monkeypatch.setattr(al, "_request", fake_request)
+    with pytest.raises(al.ActionLedgerIncompleteError):
+        al.close_action_ledger("uuid-open-1", outcome="completed")
+
+
+def test_close_completed_allow_zero_cost(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, body=None, prefer=None, extra_headers=None):
+        calls.append(body)
+        return [{"id": "uuid-open-1", "status": "closed"}]
+
+    monkeypatch.setattr(al, "_request", fake_request)
+    al.close_action_ledger("uuid-open-1", outcome="completed", allow_zero_cost=True)
+    assert calls[0]["cost_usd"] == 0.0
+    assert calls[0]["pricing_source"] == "true_zero_no_spend"
+
+
+def test_close_blocked_outcome_allows_null_cost(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, body=None, prefer=None, extra_headers=None):
+        calls.append(body)
+        return [{"id": "uuid-open-1", "status": "closed"}]
+
+    monkeypatch.setattr(al, "_request", fake_request)
+    al.close_action_ledger("uuid-open-1", outcome="blocked")
+    assert calls[0]["cost_usd"] is None
+    assert calls[0]["outcome"] == "blocked"
+
+
+def test_close_fills_cost_from_session_db(tmp_path, monkeypatch):
+    profile = "cole-espinoza"
+    session_id = "20260811_session_test"
+    db = tmp_path / "profiles" / profile / "state.db"
+    db.parent.mkdir(parents=True)
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL,
+            cost_status TEXT
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (session_id, "x-ai/grok-4.5", 100, 50, 0, 0, 0, 0.1234, None, "estimated"),
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.setattr(al, "_HERMES_ROOT", tmp_path)
+    calls = []
+
+    def fake_request(method, path, body=None, prefer=None, extra_headers=None):
+        calls.append(body)
+        return [{"id": "uuid-open-1", "status": "closed"}]
+
+    monkeypatch.setattr(al, "_request", fake_request)
+    al.close_action_ledger(
+        "uuid-open-1",
+        outcome="completed",
+        profile=profile,
+        session_id=session_id,
+    )
+    assert calls[0]["cost_usd"] == pytest.approx(0.1234)
+    assert calls[0]["prompt_tokens"] == 100
+    assert calls[0]["completion_tokens"] == 50
+    assert calls[0]["session_id"] == session_id
+    assert calls[0]["pricing_source"] == "session_db"
+
+
+def test_require_cost_on_when_service_configured(monkeypatch):
+    monkeypatch.delenv("HERMES_HAL_REQUIRE_COST", raising=False)
+    assert al.require_cost_on_complete() is True
+    monkeypatch.setenv("HERMES_HAL_REQUIRE_COST", "0")
+    assert al.require_cost_on_complete() is False
 
 
 def test_missing_service_key_raises(monkeypatch):

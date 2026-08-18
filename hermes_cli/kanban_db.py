@@ -289,27 +289,153 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
         _log.debug("action_ledger open failed for %s: %s", task_id, exc)
 
 
-def _best_effort_action_ledger_close(
+class ActionLedgerCloseError(RuntimeError):
+    """Raised when HAL close is required and fails (fail-closed complete)."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"action_ledger close blocked for {task_id}: {reason}")
+
+
+def _worker_session_for_hal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    task: "Task",
+    metadata: Optional[dict],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve (profile, session_id) for session-backed HAL cost.
+
+    Prefers completion metadata, then task.session_id, then latest run metadata
+    worker_session_id (stamped by the dispatcher when the worker starts).
+    """
+    md = metadata if isinstance(metadata, dict) else {}
+    session_id = (
+        md.get("session_id")
+        or md.get("worker_session_id")
+        or getattr(task, "session_id", None)
+    )
+    profile = (
+        md.get("profile")
+        or md.get("worker_profile")
+        or getattr(task, "assignee", None)
+    )
+    if session_id and profile:
+        return str(profile), str(session_id)
+
+    # Pull from latest run metadata when the worker stamped it there.
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row and row["metadata"]:
+            run_md = json.loads(row["metadata"] or "{}")
+            if isinstance(run_md, dict):
+                session_id = session_id or run_md.get("worker_session_id") or run_md.get(
+                    "session_id"
+                )
+                profile = profile or run_md.get("worker_profile") or run_md.get("profile")
+    except Exception:
+        pass
+    return (
+        str(profile) if profile else None,
+        str(session_id) if session_id else None,
+    )
+
+
+def _require_action_ledger_close(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    outcome: str = "completed",
 ) -> None:
-    """Close the Supabase action_ledger row on complete — never raises."""
+    """Close HAL with session-backed cost BEFORE marking done.
+
+    Fail-closed when the service role is configured (or HERMES_HAL_REQUIRE_COST=1):
+    missing ledger row / missing cost evidence blocks complete so work cannot
+    finish without honest documentation. Opt out with HERMES_HAL_REQUIRE_COST=0.
+    """
     try:
-        from hermes_cli.action_ledger import close_action_ledger
+        from hermes_cli.action_ledger import (
+            ActionLedgerError,
+            ActionLedgerIncompleteError,
+            close_action_ledger,
+            open_action_ledger,
+            require_cost_on_complete,
+            service_role_configured,
+        )
     except Exception as exc:  # pragma: no cover
         _log.debug("action_ledger close import failed: %s", exc)
         return
+
+    strict = require_cost_on_complete()
+    task = get_task(conn, task_id)
+    if task is None:
+        if strict:
+            raise ActionLedgerCloseError(task_id, "task not found for HAL close")
+        return
+
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    profile, session_id = _worker_session_for_hal(conn, task_id, task, md)
+    if session_id and "session_id" not in md:
+        md["session_id"] = session_id
+    if profile and "profile" not in md:
+        md["profile"] = profile
+
+    ledger_id = getattr(task, "action_ledger_id", None)
+    linear_id = getattr(task, "linear_issue_id", None) or resolve_task_linear_issue_id(
+        conn, task_id, persist=False
+    )
+
+    # Late-open: claim path may have failed open; still require a row on complete.
+    if not ledger_id:
+        if not service_role_configured() and not strict:
+            return
+        try:
+            agent_name = task.assignee or profile or "unknown"
+            ledger_id = open_action_ledger(
+                linear_issue_id=linear_id,
+                agent_name=agent_name,
+                job_title=task.title,
+                kanban_task_id=task_id,
+                session_id=session_id,
+            )
+            if ledger_id:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET action_ledger_id = ? WHERE id = ? "
+                        "AND (action_ledger_id IS NULL OR action_ledger_id = '')",
+                        (ledger_id, task_id),
+                    )
+                    _append_event(
+                        conn,
+                        task_id,
+                        "action_ledger_opened",
+                        {
+                            "action_ledger_id": ledger_id,
+                            "linear_issue_id": linear_id,
+                            "late_open": True,
+                        },
+                    )
+        except ActionLedgerError as exc:
+            if strict:
+                raise ActionLedgerCloseError(
+                    task_id, f"HAL open on complete failed: {exc}"
+                ) from exc
+            _log.debug("action_ledger late-open failed for %s: %s", task_id, exc)
+            return
+
+    if not ledger_id:
+        if strict:
+            raise ActionLedgerCloseError(task_id, "no action_ledger_id after open attempt")
+        return
+
+    allow_zero = bool(md.get("allow_zero_cost") or md.get("hal_true_zero"))
     try:
-        task = get_task(conn, task_id)
-        if task is None:
-            return
-        ledger_id = getattr(task, "action_ledger_id", None)
-        if not ledger_id:
-            return
-        md = metadata if isinstance(metadata, dict) else {}
         close_action_ledger(
             ledger_id,
             tools_used=md.get("tools_used"),
@@ -320,18 +446,86 @@ def _best_effort_action_ledger_close(
             cost_usd=md.get("cost_usd"),
             cost_status=md.get("cost_status"),
             pricing_source=md.get("pricing_source"),
-            outcome="completed",
+            outcome=outcome or "completed",
             signature_md=md.get("signature_md") or summary,
+            session_id=session_id,
+            profile=profile,
+            allow_zero_cost=allow_zero,
         )
-        with write_txn(conn):
-            _append_event(
-                conn,
-                task_id,
-                "action_ledger_closed",
-                {"action_ledger_id": ledger_id, "outcome": "completed"},
-            )
-    except Exception as exc:
+    except ActionLedgerIncompleteError as exc:
+        if strict:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_hal",
+                    {
+                        "schema_version": 1,
+                        "reason": "cost_required",
+                        "detail": str(exc),
+                        "action_ledger_id": ledger_id,
+                        "session_id": session_id,
+                        "profile": profile,
+                    },
+                )
+            raise ActionLedgerCloseError(task_id, str(exc)) from exc
+        _log.warning("action_ledger incomplete close (soft) for %s: %s", task_id, exc)
+        return
+    except ActionLedgerError as exc:
+        if strict:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_hal",
+                    {
+                        "schema_version": 1,
+                        "reason": "close_failed",
+                        "detail": str(exc),
+                        "action_ledger_id": ledger_id,
+                    },
+                )
+            raise ActionLedgerCloseError(task_id, str(exc)) from exc
         _log.debug("action_ledger close failed for %s: %s", task_id, exc)
+        return
+
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "action_ledger_closed",
+            {
+                "action_ledger_id": ledger_id,
+                "outcome": outcome or "completed",
+                "session_id": session_id,
+                "profile": profile,
+            },
+        )
+
+
+def _best_effort_action_ledger_close(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Legacy soft-close wrapper — never raises. Prefer ``_require_action_ledger_close``."""
+    try:
+        # Temporarily disable strict so callers that still use best-effort stay soft.
+        prev = os.environ.get("HERMES_HAL_REQUIRE_COST")
+        os.environ["HERMES_HAL_REQUIRE_COST"] = "0"
+        try:
+            _require_action_ledger_close(
+                conn, task_id, summary=summary, metadata=metadata, outcome="completed"
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("HERMES_HAL_REQUIRE_COST", None)
+            else:
+                os.environ["HERMES_HAL_REQUIRE_COST"] = prev
+    except Exception as exc:
+        _log.debug("action_ledger best-effort close failed for %s: %s", task_id, exc)
 
 
 # A running task's claim is valid for 15 minutes by default; after that the
@@ -533,7 +727,26 @@ def finalize_kanban_worker_terminal_loop_error(
             # Already terminal (blocked/done/etc). Treat as success so the
             # worker can exit without a bare protocol_violation ghost.
             return out
-        meta = {
+        # Loop-error annotation only. HEL-3988: capture any prior linear stamp
+        # BEFORE block_task — `_end_run` nulls metadata when called without
+        # a metadata dict, so post-block readback would always miss the stamp.
+        prior: dict = {}
+        try:
+            pre_run = latest_run(conn, tid)
+            if pre_run is not None:
+                raw_prior = getattr(pre_run, "metadata", None)
+                if isinstance(raw_prior, str) and raw_prior.strip():
+                    try:
+                        parsed = json.loads(raw_prior)
+                        if isinstance(parsed, dict):
+                            prior = parsed
+                    except Exception:
+                        prior = {}
+                elif isinstance(raw_prior, dict):
+                    prior = dict(raw_prior)
+        except Exception:
+            prior = {}
+        loop_meta = {
             "source": "worker_terminal_loop_error",
             "loop_error": reason,
             "partial": bool(result.get("partial")) if isinstance(result, dict) else None,
@@ -557,9 +770,18 @@ def finalize_kanban_worker_terminal_loop_error(
             return out
         # Annotate the just-ended run so BEL triage sees a loop error, not a
         # bare protocol_violation. block_task ends the run without metadata.
+        # Merge-preserve linear_issue_id / linear_issue_source so terminal
+        # loop-error finalize cannot wipe HEL-3988 attribution (live fleet
+        # residual: 17/124 runs wiped by wholesale metadata replace).
         try:
             run = latest_run(conn, tid)
             if run is not None:
+                meta = dict(prior)
+                meta.update(loop_meta)
+                # Explicit preserve: loop_meta must never null out a better stamp.
+                for stamp_key in ("linear_issue_id", "linear_issue_source"):
+                    if stamp_key in prior and prior[stamp_key] is not None:
+                        meta[stamp_key] = prior[stamp_key]
                 with write_txn(conn):
                     conn.execute(
                         """
@@ -7361,6 +7583,19 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # HAL cost gate BEFORE the done write (HEL-4156 follow-up). Fail-closed
+    # when the service role is configured so work cannot finish without an
+    # honest closed ledger row. Raises ActionLedgerCloseError; task stays
+    # in-flight. Soft path remains available via HERMES_HAL_REQUIRE_COST=0.
+    _require_action_ledger_close(
+        conn,
+        task_id,
+        summary=(summary if summary is not None else result),
+        metadata=metadata if isinstance(metadata, dict) else None,
+        outcome="completed",
+    )
+
     with write_txn(conn):
         # A worker can outlive the dispatcher that gave up on its task.  Keep
         # the late completion auditable as an explicit recovery transition
@@ -7592,16 +7827,7 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
-    # Best-effort Supabase action_ledger close (HEL-4007). Never blocks complete.
-    try:
-        _best_effort_action_ledger_close(
-            conn,
-            task_id,
-            summary=(summary if summary is not None else result),
-            metadata=metadata if isinstance(metadata, dict) else None,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        _log.debug("action_ledger close after complete failed: %s", exc)
+    # HAL close already ran fail-closed above (before the done write).
     return True
 
 

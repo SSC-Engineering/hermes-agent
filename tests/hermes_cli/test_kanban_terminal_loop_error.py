@@ -113,6 +113,56 @@ def test_finalize_blocks_task_on_truncation_result(kanban_home, monkeypatch):
         conn.close()
 
 
+def test_finalize_preserves_linear_stamp_on_loop_error(kanban_home, monkeypatch):
+    """HEL-3988: terminal-loop-error finalize must not wipe linear stamp.
+
+    Live residual: finalize replaced task_runs.metadata wholesale after
+    block_task/_end_run nulled it, dropping linear_issue_id on 17/124 fleet
+    runs. Capture-before-block + merge-preserve is the fix.
+    """
+    conn = kb.connect()
+    try:
+        tid, run_id = _claim_running(conn, title="HEL-3988 stamp preserve")
+        # Seed a signature-grade stamp the way claim/stamp helpers would.
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "linear_issue_id": "HEL-3988",
+                        "linear_issue_source": "signature",
+                        "other_keep": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                run_id,
+            ),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        result = {
+            "completed": False,
+            "partial": True,
+            "error": "Response truncated due to output length limit",
+        }
+        status = kb.finalize_kanban_worker_terminal_loop_error(
+            tid, result=result, kind="transient",
+        )
+        assert status["acted"] is True, status
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        meta = json.loads(run.metadata) if isinstance(run.metadata, str) else run.metadata
+        assert meta is not None
+        assert meta.get("source") == "worker_terminal_loop_error"
+        assert meta.get("linear_issue_id") == "HEL-3988"
+        assert meta.get("linear_issue_source") == "signature"
+        assert meta.get("other_keep") is True
+        assert "truncated" in (meta.get("loop_error") or "")
+    finally:
+        conn.close()
+
+
 def test_finalize_idempotent_when_already_blocked(kanban_home, monkeypatch):
     conn = kb.connect()
     try:

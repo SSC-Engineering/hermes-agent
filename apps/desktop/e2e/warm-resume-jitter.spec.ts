@@ -33,6 +33,7 @@
 import { expect, test } from './test'
 
 import {
+  closeElectronApp,
   type MockBackendFixture,
   waitForAppReady,
   createSandbox,
@@ -132,7 +133,7 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeElectronApp(app)
       await mock.close()
       sandbox.cleanup()
     },
