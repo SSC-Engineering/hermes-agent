@@ -93,6 +93,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_cli.kanban_stage_mapping import map_task_state_to_stage
 
 _log = logging.getLogger(__name__)
 
@@ -4317,6 +4318,20 @@ def create_task(
                         "linear_issue_id": linear_issue_id,
                     },
                 )
+                # HEL-3123: single writer for current_step_key (same txn).
+                _write_current_step_key(
+                    conn,
+                    task_id,
+                    status=task_status,
+                    trigger="created",
+                    is_create=True,
+                    owner_credential=created_by or _acting_owner_credential(),
+                    mutation_idempotency_key=(
+                        f"created:{task_id}"
+                        if not idempotency_key
+                        else f"created:{idempotency_key}"
+                    ),
+                )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -5153,6 +5168,90 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, work_intent_id, idempotency_key, now),
     )
+
+
+def _acting_owner_credential() -> str:
+    """Identity of the profile/service that caused a stage transition (HEL-3123)."""
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile:
+        return profile
+    return _claimer_id()
+
+
+def _write_current_step_key(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str],
+    trigger: str,
+    block_kind: Optional[str] = None,
+    run_outcome: Optional[str] = None,
+    run_id: Optional[int] = None,
+    is_create: bool = False,
+    owner_credential: Optional[str] = None,
+    mutation_idempotency_key: Optional[str] = None,
+) -> Optional[str]:
+    """Single transactional writer for ``tasks.current_step_key`` (HEL-3123).
+
+    Must run inside the caller's open write txn, in the same commit as the
+    underlying status mutation. Maps status via
+    :func:`hermes_cli.kanban_stage_mapping.map_task_state_to_stage`, updates
+    the column only when the stage actually changes, and emits a
+    ``step_transitioned`` event whose ``idempotency_key`` is derived from the
+    underlying mutation (never a free-standing synthetic key).
+
+    Returns the stage key written (or already present), or ``None`` when the
+    mapping yields no stage.
+    """
+    stage = map_task_state_to_stage(
+        status,
+        block_kind=block_kind,
+        run_outcome=run_outcome,
+        is_create=is_create,
+    )
+    if stage is None:
+        return None
+
+    row = conn.execute(
+        "SELECT current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    previous = row["current_step_key"] if row else None
+    if previous == stage:
+        return stage
+
+    conn.execute(
+        "UPDATE tasks SET current_step_key = ? WHERE id = ?",
+        (stage, task_id),
+    )
+    owner = (owner_credential or _acting_owner_credential()).strip() or _claimer_id()
+    if mutation_idempotency_key:
+        idemp = f"step:{mutation_idempotency_key}:{stage}"
+    else:
+        idemp = f"step:{task_id}:{trigger}:{stage}"
+        if run_id is not None:
+            idemp = f"{idemp}:run:{int(run_id)}"
+    payload = {
+        "from_step": previous,
+        "to_step": stage,
+        "status": status,
+        "trigger": trigger,
+        "owner_credential": owner,
+        "idempotency_key": idemp,
+        "timestamp": int(time.time()),
+    }
+    if block_kind is not None:
+        payload["block_kind"] = block_kind
+    if run_outcome is not None:
+        payload["run_outcome"] = run_outcome
+    _append_event(
+        conn,
+        task_id,
+        "step_transitioned",
+        payload,
+        run_id=run_id,
+    )
+    return stage
 
 
 _WORK_INTENT_EVENT_TYPES = frozenset({
@@ -6502,6 +6601,16 @@ def recompute_ready(
                     "trigger": "parents_terminal",
                     "satisfied_parent_ids": [p["parent_id"] for p in parent_rows],
                 })
+                _write_current_step_key(
+                    conn,
+                    task_id,
+                    status="ready",
+                    trigger="promoted",
+                    mutation_idempotency_key=(
+                        f"promoted:{task_id}:parents_terminal:"
+                        f"{','.join(p['parent_id'] for p in parent_rows)}"
+                    ),
+                )
                 promoted += 1
     return promoted
 
@@ -6546,6 +6655,13 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            _write_current_step_key(
+                conn,
+                task_id,
+                status="todo",
+                trigger="claim_rejected",
+                mutation_idempotency_key=f"claim_rejected:{task_id}:parents_not_done",
+            )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -6582,6 +6698,16 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
+        # HEL-3123: write current_step_key before opening the run so
+        # task_runs.step_key captures the post-claim stage (execution).
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="running",
+            trigger="claimed",
+            owner_credential=lock,
+            mutation_idempotency_key=f"claimed:{task_id}:{now}:{lock}",
+        )
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -6683,6 +6809,14 @@ def claim_review_task(
         )
         if cur.rowcount != 1:
             return None
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="running",
+            trigger="claimed_review",
+            owner_credential=lock,
+            mutation_idempotency_key=f"claimed_review:{task_id}:{now}:{lock}",
+        )
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
             "FROM tasks WHERE id = ?",
@@ -6903,6 +7037,18 @@ def release_stale_claims(
                 conn, row["id"], "reclaimed",
                 payload,
                 run_id=run_id,
+            )
+            _write_current_step_key(
+                conn,
+                row["id"],
+                status="ready",
+                trigger="reclaimed",
+                run_id=run_id,
+                mutation_idempotency_key=(
+                    f"reclaimed:{row['id']}:run:{run_id}"
+                    if run_id is not None
+                    else f"reclaimed:{row['id']}"
+                ),
             )
             reclaimed += 1
         # Count the reclaim against the unified failure counter so repeated
@@ -7629,6 +7775,19 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="done",
+            trigger="completed",
+            run_outcome="completed",
+            run_id=run_id,
+            mutation_idempotency_key=(
+                f"completed:{task_id}:run:{run_id}"
+                if run_id is not None
+                else f"completed:{task_id}"
+            ),
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8337,6 +8496,19 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
+            _write_current_step_key(
+                conn,
+                task_id,
+                status="todo",
+                trigger="dependency_wait",
+                block_kind=kind,
+                run_id=run_id,
+                mutation_idempotency_key=(
+                    f"dependency_wait:{task_id}:run:{run_id}"
+                    if run_id is not None
+                    else f"dependency_wait:{task_id}"
+                ),
+            )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -8428,6 +8600,19 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            _write_current_step_key(
+                conn,
+                task_id,
+                status="triage",
+                trigger="block_loop_detected",
+                block_kind=kind,
+                run_id=run_id,
+                mutation_idempotency_key=(
+                    f"block_loop:{task_id}:run:{run_id}:n{recurrences}"
+                    if run_id is not None
+                    else f"block_loop:{task_id}:n{recurrences}"
+                ),
+            )
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -8479,6 +8664,19 @@ def block_task(
                 conn, task_id, "blocked",
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
+            )
+            _write_current_step_key(
+                conn,
+                task_id,
+                status="blocked",
+                trigger="blocked",
+                block_kind=kind,
+                run_id=run_id,
+                mutation_idempotency_key=(
+                    f"blocked:{task_id}:run:{run_id}:n{recurrences}"
+                    if run_id is not None
+                    else f"blocked:{task_id}:n{recurrences}"
+                ),
             )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -8550,6 +8748,14 @@ def promote_task(
             "promoted_manual",
             {"actor": actor, "reason": reason, "forced": force},
         )
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="ready",
+            trigger="promoted_manual",
+            owner_credential=actor or _acting_owner_credential(),
+            mutation_idempotency_key=f"promoted_manual:{task_id}:{actor or 'unknown'}",
+        )
 
     return True, None
 
@@ -8612,6 +8818,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
+        )
+        _write_current_step_key(
+            conn,
+            task_id,
+            status=new_status,
+            trigger="unblocked",
+            mutation_idempotency_key=f"unblocked:{task_id}:{new_status}",
         )
         return True
 
@@ -8697,6 +8910,14 @@ def specify_triage_task(
             task_id,
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
+        )
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="todo",
+            trigger="specified",
+            owner_credential=(author or _acting_owner_credential()),
+            mutation_idempotency_key=f"specified:{task_id}",
         )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
@@ -9053,6 +9274,18 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="archived",
+            trigger="archived",
+            run_id=run_id,
+            mutation_idempotency_key=(
+                f"archived:{task_id}:run:{run_id}"
+                if run_id is not None
+                else f"archived:{task_id}"
+            ),
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -9564,6 +9797,18 @@ def schedule_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _write_current_step_key(
+            conn,
+            task_id,
+            status="scheduled",
+            trigger="scheduled",
+            run_id=run_id,
+            mutation_idempotency_key=(
+                f"scheduled:{task_id}:run:{run_id}"
+                if run_id is not None
+                else f"scheduled:{task_id}"
+            ),
+        )
         return True
 
 

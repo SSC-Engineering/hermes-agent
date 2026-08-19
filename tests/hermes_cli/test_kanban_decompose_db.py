@@ -70,7 +70,10 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         child_events = kb.list_events(conn, child_ids[0])
     created = next(event for event in child_events if event.kind == "created")
     assert created.payload["domain"] == "UNKNOWN"
-    assert c0.current_step_key is None
+    # HEL-3123: recompute_ready writes planning for the promoted child.
+    # The sibling still waiting on parents stays todo; decompose inlines
+    # INSERT and does not invent a second writer, so that key stays NULL.
+    assert c0.current_step_key == "planning"
     assert c1.current_step_key is None
 
 
