@@ -1,0 +1,110 @@
+name: Upstream sync PR
+
+# Opens (or refreshes) a PR that brings NousResearch/hermes-agent#main into
+# this fork without touching fork `main`. Unique fork commits stay on `main`.
+# A human tests and merges the PR. Nothing auto-merges.
+#
+# The scheduled job only fires once this workflow is on the default branch.
+
+on:
+  schedule:
+    # 07:00 America/Phoenix (MST = UTC-7)
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-pr
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Open Nous sync PR
+    if: github.repository == 'SSC-Engineering/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Nous main and publish sync branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: NousResearch/hermes-agent
+          SYNC_BRANCH: sync/nous-upstream
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/heads/main:refs/remotes/nous/main"
+
+          UPSTREAM_SHA=$(git rev-parse nous/main)
+          SHORT=${UPSTREAM_SHA:0:10}
+          BEHIND=$(git rev-list --count origin/main..nous/main)
+          AHEAD=$(git rev-list --count nous/main..origin/main)
+          echo "fork unique=${AHEAD}  behind_nous=${BEHIND}  nous=${SHORT}"
+
+          # SHA equality is the wrong parity test after a merge commit:
+          # fork main can contain every Nous commit and still differ.
+          if [ "$BEHIND" = "0" ]; then
+            echo "Already at parity with ${UPSTREAM_REPO}@${SHORT}"
+            exit 0
+          fi
+
+          # Publish Nous tip as a moving window. Force is intentional: this
+          # branch is never unique work, only the upstream snapshot to merge.
+          git push --force origin "nous/main:refs/heads/${SYNC_BRANCH}"
+
+          BODY=$(cat <<EOF
+          ## Summary
+
+          Automated catch-up from [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) \`main\`.
+
+          | | |
+          |---|---|
+          | Nous tip | \`${SHORT}\` |
+          | Commits on Nous not in this fork | ${BEHIND} |
+          | Unique fork commits (kept on \`main\`) | ${AHEAD} |
+
+          This PR **does not** rewrite fork \`main\`. Unique SSC work stays
+          on \`main\`; merging this PR is a 3-way merge you can test first.
+
+          ## Test plan
+
+          - [ ] Review the merge (expect conflicts on kanban / HELIos files)
+          - [ ] Run \`pytest tests/hermes_cli tests/tools/test_kanban_tools.py\`
+          - [ ] Smoke \`hermes --help\` and a local kanban create/show
+          - [ ] Merge only if you want this Nous snapshot
+
+          Do **not** squash if you want to keep Nous first-parent history
+          readable — use a merge commit.
+          EOF
+          )
+
+          EXISTING=$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" \
+              --title "chore(sync): Nous ${SHORT} (${BEHIND} commits)" \
+              --body "$BODY"
+            gh pr comment "$EXISTING" --body \
+              "Refreshed to Nous \`${SHORT}\` — ${BEHIND} commits behind, ${AHEAD} unique fork commits kept on \`main\`."
+            echo "Updated existing PR #${EXISTING}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "chore(sync): Nous ${SHORT} (${BEHIND} commits)" \
+              --body "$BODY"
+          fi
