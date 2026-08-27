@@ -75,8 +75,10 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    is_nvidia_nim_endpoint,
     is_zai_coding_overload_error,
     jittered_backoff,
+    should_defer_eager_fallback_for_nvidia_nim,
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
@@ -4275,8 +4277,20 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # HEL-6108: free NVIDIA NIM intermittent 429s must retry with
+                # backoff on the same rail BEFORE paid fallback_model engages.
+                # Without this, every free-tier 429 fell straight to nous/grok.
+                _defer_nim_eager_fallback = should_defer_eager_fallback_for_nvidia_nim(
+                    provider=_provider,
+                    base_url=str(_base) if _base is not None else None,
+                    model=_model,
+                    is_rate_limited=is_rate_limited
+                    and classified.reason != FailoverReason.billing,
+                    retry_count=retry_count,
+                    max_retries=max_retries,
+                )
                 _should_fallback = (
-                    is_rate_limited
+                    (is_rate_limited and not _defer_nim_eager_fallback)
                     or (_is_transport_failure and retry_count >= 2)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -4321,6 +4335,22 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+                elif _defer_nim_eager_fallback:
+                    # Observable retry pressure (HEL-6108 AC): model id + attempt.
+                    logger.info(
+                        "%sNVIDIA NIM free-tier 429 — retrying before paid fallback "
+                        "(model=%s attempt=%s/%s provider=%s)",
+                        agent.log_prefix,
+                        _model,
+                        retry_count,
+                        max_retries,
+                        _provider,
+                    )
+                    agent._buffer_status(
+                        f"⏱️ NVIDIA NIM rate limited on {_model} — "
+                        f"retrying with backoff before paid fallback "
+                        f"(attempt {retry_count}/{max_retries})..."
+                    )
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
@@ -5308,13 +5338,22 @@ def run_conversation(
                         model=_model,
                         error=api_error,
                         default_wait=wait_time,
+                        provider=_provider,
                     )
+                elif is_rate_limited and _retry_after and is_nvidia_nim_endpoint(
+                    provider=_provider,
+                    base_url=str(_base) if _base is not None else None,
+                ):
+                    # Retry-After present: keep the header wait, still label NIM.
+                    _backoff_policy = "nvidia_nim_free_tier"
                 if is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
+                    elif _backoff_policy == "nvidia_nim_free_tier":
+                        _policy_note = f" (NVIDIA NIM free-tier backoff, model={_model})"
                     _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
@@ -5327,10 +5366,11 @@ def run_conversation(
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
-                    "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
+                    "Retrying API call in %ss (attempt %s/%s model=%s) %s policy=%s error=%s",
                     wait_time,
                     retry_count,
                     max_retries,
+                    _model,
                     agent._client_log_context(),
                     _backoff_policy or "default",
                     api_error,

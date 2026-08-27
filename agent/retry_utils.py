@@ -159,6 +159,71 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
     )
 
 
+# Free NVIDIA NIM (integrate.api.nvidia.com) rate-limits intermittently —
+# live probes 2026-08-25 saw ~1/3 of Ultra calls return 429 then recover.
+# Without a retry layer, every free-tier 429 fell straight through to the
+# paid fallback_model rail (nous/grok). Bounded attempts so a genuinely
+# exhausted quota still fails loudly rather than hanging. (HEL-6108)
+_NVIDIA_NIM_HOST_MARKERS = (
+    "integrate.api.nvidia.com",
+    "api.nvcf.nvidia.com",
+)
+# Default free-tier retry budget before paid fallback is considered.
+# Tuned for interactive agent loops: short enough to fail visibly,
+# long enough to ride out the intermittent free-tier windows.
+_NVIDIA_NIM_DEFAULT_RETRY_ATTEMPTS = 3
+
+
+def is_nvidia_nim_endpoint(
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Return True when the active rail is NVIDIA NIM.
+
+    Matches the built-in ``nvidia`` provider id and the canonical free-tier
+    host ``integrate.api.nvidia.com`` (plus the NVCF alias). Custom base_url
+    overrides that still point at NIM are covered by the host markers.
+    """
+    if (provider or "").strip().lower() == "nvidia":
+        return True
+    base = (base_url or "").lower()
+    return any(marker in base for marker in _NVIDIA_NIM_HOST_MARKERS)
+
+
+def should_defer_eager_fallback_for_nvidia_nim(
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    is_rate_limited: bool = False,
+    retry_count: int = 0,
+    max_retries: int | None = None,
+) -> bool:
+    """Return True when a free-NIM 429 must retry before paid fallback.
+
+    Eager fallback on the first 429 is correct for most providers (quota
+    walls rarely clear inside the retry window). Free NVIDIA NIM is the
+    exception: intermittent 429s recover within seconds, and falling through
+    to a paid rail burns budget. Defer eager fallback until the retry budget
+    is exhausted; after that the normal max-retries fallback path still runs.
+
+    ``retry_count`` is the post-increment value used by the conversation loop
+    (1 on the first failure). ``model`` is accepted for log/call-site parity
+    and is not part of the decision.
+    """
+    del model  # reserved for call-site logging; detection is provider/host based
+    if not is_rate_limited:
+        return False
+    if not is_nvidia_nim_endpoint(provider=provider, base_url=base_url):
+        return False
+    ceiling = max_retries if max_retries is not None else _NVIDIA_NIM_DEFAULT_RETRY_ATTEMPTS
+    # Defer while retries remain (retry_count < max_retries). When
+    # retry_count >= max_retries the caller falls through to the exhausted
+    # path, which may still activate fallback after the budget is spent.
+    return retry_count < ceiling
+
+
 def adaptive_rate_limit_backoff(
     attempt: int,
     *,
@@ -167,6 +232,7 @@ def adaptive_rate_limit_backoff(
     error: Any,
     default_wait: float,
     short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
+    provider: str | None = None,
 ) -> tuple[float, str | None]:
     """Provider-aware rate-limit backoff.
 
@@ -175,20 +241,41 @@ def adaptive_rate_limit_backoff(
     the normal short exponential schedule, then switch to progressively longer
     waits (30s → 60s → 90s → 120s, capped) plus light jitter.
 
+    For free NVIDIA NIM 429s, label the wait as ``nvidia_nim_free_tier`` so
+    logs carry the model/attempt context HEL-6108 requires (the delay itself
+    stays on the shared exponential schedule unless Retry-After is present).
+
     ``attempt`` is 1-based, matching the retry loop's logged attempt number.
     Returns ``(wait_seconds, reason_label)`` where ``reason_label`` is suitable
     for status/log decoration when a provider-specific policy fired.
     """
-    if not is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
-        return default_wait, None
-    if attempt <= short_attempts:
-        return default_wait, "zai_coding_overload_short"
+    if is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
+        if attempt <= short_attempts:
+            return default_wait, "zai_coding_overload_short"
 
-    idx = min(attempt - short_attempts - 1, len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) - 1)
-    base_delay = _ZAI_CODING_OVERLOAD_LONG_BACKOFF[idx]
-    # A smaller jitter ratio keeps long waits readable while still avoiding
-    # synchronized retry storms across concurrent Hermes sessions.
-    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
+        idx = min(attempt - short_attempts - 1, len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) - 1)
+        base_delay = _ZAI_CODING_OVERLOAD_LONG_BACKOFF[idx]
+        # A smaller jitter ratio keeps long waits readable while still avoiding
+        # synchronized retry storms across concurrent Hermes sessions.
+        return (
+            jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2),
+            "zai_coding_overload_long",
+        )
+
+    status = getattr(error, "status_code", None)
+    if status == 429 and is_nvidia_nim_endpoint(provider=provider, base_url=base_url):
+        # Prefer a slightly shorter base than the generic 2s rate-limit path
+        # so free-tier hiccups clear without multi-minute hangs; still
+        # exponential with jitter. Callers that already resolved Retry-After
+        # pass that value as default_wait and we leave it alone.
+        if default_wait and default_wait > 0:
+            # Caller supplied Retry-After or a precomputed wait — keep it,
+            # only stamp the policy label for observability.
+            return default_wait, "nvidia_nim_free_tier"
+        wait = jittered_backoff(attempt, base_delay=1.0, max_delay=30.0)
+        return wait, "nvidia_nim_free_tier"
+
+    return default_wait, None
 
 
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
