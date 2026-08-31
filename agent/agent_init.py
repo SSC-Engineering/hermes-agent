@@ -670,6 +670,79 @@ def init_agent(
         except Exception:
             agent._credential_pool = None
 
+    # ── NVIDIA NIM kanban-worker exclusive key lease (HEL-6226) ───────────
+    # NVIDIA NIM free-tier is capped at 40 requests/minute PER API KEY (per
+    # the NVIDIA developer UI, confirmed by Dan on 2026-08-30). Kanban BUILD
+    # bursts (6 workers) share one pool and, without an exclusive claim on
+    # spawn, all six collide on the same key and 429-storm. The delegate-
+    # subagent path (tools/delegate_tool.py) already calls acquire_lease()
+    # per child, but kanban workers spawn as fully independent Popen
+    # subprocesses — so we need a CROSS-PROCESS lease keyed off the
+    # credential id. Handled here (once per agent init) rather than in
+    # cli.py so every entry point that binds a credential pool for a
+    # kanban-worker process gets the exclusive claim automatically.
+    agent._nim_worker_credential_id = None
+    agent._nim_worker_holder_token = None
+    try:
+        from agent.nim_governor import (
+            acquire_kanban_worker_lease,
+            is_kanban_worker_process,
+            is_nim_endpoint,
+            is_nim_provider,
+        )
+
+        if (
+            agent._credential_pool is not None
+            and is_kanban_worker_process()
+            and (is_nim_provider(agent.provider) or is_nim_endpoint(agent.base_url))
+        ):
+            _holder = f"pid{os.getpid()}-{time.time_ns()}"
+            _leased = acquire_kanban_worker_lease(
+                agent._credential_pool, holder_token=_holder,
+            )
+            if _leased:
+                agent._nim_worker_credential_id = _leased
+                agent._nim_worker_holder_token = _holder
+                # Register the lease with the in-process pool too so any
+                # sibling delegated child running in this same process reuses
+                # the same accounting.
+                try:
+                    agent._credential_pool.acquire_lease(_leased)
+                except Exception:
+                    pass
+                # Bind the runtime credential to the leased entry so this
+                # worker's HTTP calls go through the key we just reserved.
+                try:
+                    _entries = agent._credential_pool.entries()
+                    _match = next(
+                        (e for e in _entries if getattr(e, "id", None) == _leased),
+                        None,
+                    )
+                    if _match is not None and hasattr(agent, "_swap_credential"):
+                        agent._swap_credential(_match)
+                except Exception:
+                    pass
+                import atexit
+                # atexit is the fallback release path for crash exits and
+                # kanban's forced os._exit(128+signum) still fires it because
+                # the KanbanWorker signal handler flushes logging before it
+                # exits (cli.py signal handler). release_lease is idempotent
+                # so a double-release from atexit + explicit shutdown is safe.
+                def _release_nim_lease_atexit(cid=_leased, tok=_holder, pool=agent._credential_pool):
+                    try:
+                        from agent.nim_governor import release_kanban_worker_lease
+                        release_kanban_worker_lease(cid, tok)
+                    except Exception:
+                        pass
+                    try:
+                        pool.release_lease(cid)
+                    except Exception:
+                        pass
+                atexit.register(_release_nim_lease_atexit)
+    except Exception:
+        # NIM governor is a policy overlay; never let it break agent init.
+        pass
+
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
     try:
