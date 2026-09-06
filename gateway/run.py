@@ -11566,6 +11566,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("Idle agent sweep failed: %s", _e)
 
+                # Stale-session ledger sweep (HEL-6658): close action_ledger
+                # rows whose session no longer exists in state.db with
+                # ``outcome = abandoned``, so a session killed without a clean
+                # shutdown still leaves a closed record. Same cadence as the
+                # expiry watcher it rides on.
+                try:
+                    await asyncio.to_thread(self._sweep_stale_session_ledgers)
+                except Exception as _e:
+                    logger.debug("Session ledger sweep failed: %s", _e)
+
                 # Periodically prune stale SessionStore entries.  The
                 # in-memory dict (and sessions.json) would otherwise grow
                 # unbounded in gateways serving many rotating chats /
@@ -22508,6 +22518,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     daemon=True,
                     name=f"agent-cache-evict-{key[:24]}",
                 ).start()
+
+    def _sweep_stale_session_ledgers(self) -> int:
+        """Close ledger rows orphaned by sessions that no longer exist.
+
+        Driven by ``_session_expiry_watcher`` (HEL-6658). Fail-open: a sweep
+        failure is counted as a ledger defect in state.db, never raised at the
+        gateway loop.
+        """
+        db = getattr(self, "_session_db", None)
+        db = getattr(db, "_db", None) or db
+        if db is None:
+            return 0
+        try:
+            from hermes_cli.action_ledger import sweep_stale_session_ledgers
+
+            return sweep_stale_session_ledgers(db=db)
+        except Exception as exc:  # pragma: no cover - fail-open by contract
+            logger.debug("Session ledger sweep unavailable: %s", exc)
+            return 0
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.

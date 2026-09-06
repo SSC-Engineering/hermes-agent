@@ -2772,9 +2772,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create a new session record. Returns the session_id."""
+        """Create a new session record. Returns the session_id.
+
+        Opening the session's ``public.action_ledger`` row is part of creating
+        the session (HEL-6658) — not an instruction a skill may forget. The
+        hook is fail-open and only reaches the network when a HELIOS service
+        role is configured, so an install without one is untouched.
+        """
         self._insert_session_row(session_id, source, **kwargs)
+        self.open_session_ledger_row(
+            session_id, source, profile=kwargs.get("profile_name")
+        )
         return session_id
+
+    # ── Session accountability ledger (HEL-6658) ──────────────────────
+
+    def open_session_ledger_row(
+        self, session_id: str, source: str, *, profile: Optional[str] = None
+    ) -> Optional[str]:
+        """Open (or adopt) this session's action_ledger row. Never raises.
+
+        A kanban worker's row is already open from claim; it is adopted by
+        session id / task id rather than duplicated.
+        """
+        try:
+            from hermes_cli.action_ledger import open_session_ledger
+
+            return open_session_ledger(
+                session_id, source, profile, db=self
+            )
+        except Exception as exc:  # pragma: no cover - fail-open by contract
+            logger.warning(
+                "Session ledger open hook failed for %s: %s", session_id, exc
+            )
+            return None
+
+    def close_session_ledger_row(
+        self,
+        session_id: str,
+        *,
+        outcome: str = "completed",
+        profile: Optional[str] = None,
+    ) -> Optional[str]:
+        """Close this session's action_ledger row. Never raises."""
+        try:
+            from hermes_cli.action_ledger import close_session_ledger
+
+            return close_session_ledger(
+                session_id, outcome=outcome, profile=profile, db=self
+            )
+        except Exception as exc:  # pragma: no cover - fail-open by contract
+            logger.warning(
+                "Session ledger close hook failed for %s: %s", session_id, exc
+            )
+            return None
 
     def record_gateway_session_peer(
         self,
@@ -3230,6 +3281,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (time.time(), end_reason, session_id),
             )
         self._execute_write(_do)
+        # A session that ends leaves a closed ledger row, whatever ended it
+        # (HEL-6658 / HEL-6128 AC2). Idempotent: a row already closed is a
+        # no-op, so an explicit close on the expiry path still wins the outcome.
+        try:
+            from hermes_cli.action_ledger import outcome_for_end_reason
+
+            outcome = outcome_for_end_reason(end_reason)
+        except Exception:  # pragma: no cover - defensive
+            outcome = "completed"
+        self.close_session_ledger_row(session_id, outcome=outcome)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""

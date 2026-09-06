@@ -1918,6 +1918,18 @@ class SessionStore:
                     "Session DB promote_to_session_reset failed for %s: %s",
                     entry.session_id, exc,
                 )
+            # Expiry finalization is where a gateway session actually ends, so
+            # it is where its action_ledger row closes — outcome ``expired``
+            # (HEL-6658). Fail-open by contract inside the hook.
+            try:
+                closer = getattr(self._db, "close_session_ledger_row", None)
+                if callable(closer):
+                    closer(entry.session_id, outcome="expired")
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "Session ledger close failed for %s: %s",
+                    entry.session_id, exc,
+                )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.

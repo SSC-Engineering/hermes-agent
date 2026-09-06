@@ -17280,6 +17280,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Close session in SQLite
             if hasattr(self, '_session_db') and self._session_db and self.agent:
+                # Close the session's action_ledger row first (HEL-6658), so a
+                # CLI that is unwinding an exception reports ``failed`` rather
+                # than the ``completed`` the end_session hook would infer from
+                # the ``cli_close`` reason. sys.exc_info() in a finally block is
+                # the exception being propagated, so no extra state is needed.
+                try:
+                    _ledger_outcome = (
+                        "failed" if sys.exc_info()[0] not in (None, KeyboardInterrupt)
+                        else "completed"
+                    )
+                    _ledger_close = getattr(
+                        self._session_db, "close_session_ledger_row", None
+                    )
+                    if callable(_ledger_close):
+                        _ledger_close(
+                            self.agent.session_id, outcome=_ledger_outcome
+                        )
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug("Could not close session ledger row: %s", e)
                 try:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:
