@@ -357,6 +357,13 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            # An ad hoc CLI session is screened by the same fleet allowlist a
+            # dispatched kanban job is (HEL-6661). Fail-closed: a forbidden rail
+            # refuses the session (the except below reports the rule id and
+            # returns False) instead of starting on an unallocated model.
+            # Dispatched workers (HERMES_KANBAN_TASK) are deliberately untouched
+            # — their spawn enforcement is owned by the spawn path.
+            effective_model = self._screen_adhoc_session_model(effective_model)
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -460,6 +467,51 @@ class CLIAgentSetupMixin:
         except Exception as e:
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
             return False
+
+    def _screen_adhoc_session_model(self, effective_model: str) -> str:
+        """Screen an ad hoc CLI session's model against fleet model policy.
+
+        Returns the model to run (possibly the policy's ``restricted_downgrade``).
+        Raises ``ModelPolicySessionRefused`` when the rail is forbidden, after
+        leaving a ``policy_refused`` ledger row for spend reporting.
+        """
+        import os as _os
+
+        if not effective_model:
+            return effective_model
+        if (_os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+            return effective_model
+        try:
+            from hermes_cli.model_policy import (
+                ModelPolicySessionRefused,
+                enforce_session_model,
+            )
+        except Exception:  # pragma: no cover - policy module unavailable
+            return effective_model
+        profile = getattr(self, "profile", None) or getattr(self, "profile_name", None)
+        if not profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                profile = get_active_profile_name()
+            except Exception:
+                profile = _os.environ.get("HERMES_PROFILE")
+        try:
+            return enforce_session_model(profile, effective_model, session_kind="operator")
+        except ModelPolicySessionRefused as refusal:
+            try:
+                from hermes_cli.action_ledger import record_policy_refusal
+
+                record_policy_refusal(
+                    getattr(self, "session_id", "") or "",
+                    profile=profile,
+                    rule_id=refusal.rule_id,
+                    model=effective_model,
+                    db=getattr(self, "_session_db", None),
+                )
+            except Exception:  # pragma: no cover - fail-open by contract
+                pass
+            raise
 
     def _preload_resumed_session(self) -> bool:
         """Load a resumed session's history from the DB early (before first chat).

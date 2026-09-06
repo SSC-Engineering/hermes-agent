@@ -1032,3 +1032,42 @@ def sweep_stale_session_ledgers(
             "session ledger sweep closed %d abandoned row(s) for %s", closed, agent_name
         )
     return closed
+
+
+def record_policy_refusal(
+    session_id: str,
+    *,
+    profile: Optional[str],
+    rule_id: str,
+    model: Optional[str] = None,
+    db: Any = None,
+    session_kind: str = SESSION_KIND_OPERATOR,
+) -> Optional[str]:
+    """Leave a closed ``policy_refused`` row for a session policy would not start.
+
+    A refusal is spend that did not happen for a stated reason; it belongs in
+    the ledger so refusals are visible in spend reporting alongside the sessions
+    that did run (HEL-6661).
+    """
+    if not session_id or not session_ledger_enabled():
+        return None
+    ledger_id = open_session_ledger(
+        session_id,
+        source="policy",
+        profile=profile,
+        db=db,
+        job_title=OPERATOR_JOB_TITLE,
+        session_kind=session_kind,
+        track_for_exit=False,
+    )
+    if not ledger_id:
+        return None
+    return close_session_ledger(
+        session_id,
+        outcome=OUTCOME_POLICY_REFUSED,
+        profile=profile,
+        db=db,
+        ledger_id=ledger_id,
+        llm_model=model,
+        tools_used=[f"model-policy:{rule_id}"],
+    )
