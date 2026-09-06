@@ -6727,7 +6727,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
+        # An ad hoc gateway session is screened by the same allowlist a
+        # dispatched kanban job is (HEL-6661). Fail-closed: a forbidden rail
+        # raises before the first request instead of quietly running.
+        model = self._screen_session_model(model, resolved_session_key)
+
         return model, runtime_kwargs
+
+    def _screen_session_model(
+        self, model: str, session_key: Optional[str] = None
+    ) -> str:
+        """Screen an ad hoc session's model against fleet model policy.
+
+        Returns the model the session may run — the requested one, or the
+        policy's ``restricted_downgrade`` when it names a safe rail. Raises
+        ``ModelPolicySessionRefused`` (carrying the violated rule id) when the
+        rail is forbidden, and leaves a ``policy_refused`` ledger row so the
+        refusal is visible in spend reporting.
+        """
+        if not model:
+            return model
+        try:
+            from hermes_cli.model_policy import (
+                ModelPolicySessionRefused,
+                enforce_session_model,
+            )
+        except Exception:  # pragma: no cover - policy module unavailable
+            return model
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+        except Exception:
+            profile = None
+        try:
+            return enforce_session_model(profile, model, session_kind="operator")
+        except ModelPolicySessionRefused as refusal:
+            logger.warning(
+                "Gateway session refused on model policy %s: %s",
+                refusal.rule_id, refusal.reason,
+            )
+            self._record_session_policy_refusal(session_key, profile, refusal)
+            raise
+
+    def _record_session_policy_refusal(
+        self, session_key: Optional[str], profile: Optional[str], refusal
+    ) -> None:
+        """Leave a closed ``policy_refused`` ledger row for a refused session."""
+        try:
+            from hermes_cli.action_ledger import record_policy_refusal
+
+            db = getattr(self, "_session_db", None)
+            db = getattr(db, "_db", None) or db
+            session_id = None
+            store = getattr(self, "session_store", None)
+            entries = getattr(store, "_entries", None) if store else None
+            if session_key and isinstance(entries, dict):
+                entry = entries.get(session_key)
+                session_id = getattr(entry, "session_id", None)
+            if not session_id:
+                return
+            record_policy_refusal(
+                session_id,
+                profile=profile,
+                rule_id=refusal.rule_id,
+                model=getattr(refusal, "model", None),
+                db=db,
+            )
+        except Exception as exc:  # pragma: no cover - fail-open by contract
+            logger.debug("policy_refused ledger row failed: %s", exc)
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -11565,6 +11633,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _e:
                     logger.debug("Idle agent sweep failed: %s", _e)
+
+                # Stale-session ledger sweep (HEL-6658): close action_ledger
+                # rows whose session no longer exists in state.db with
+                # ``outcome = abandoned``, so a session killed without a clean
+                # shutdown still leaves a closed record. Same cadence as the
+                # expiry watcher it rides on.
+                try:
+                    await asyncio.to_thread(self._sweep_stale_session_ledgers)
+                except Exception as _e:
+                    logger.debug("Session ledger sweep failed: %s", _e)
 
                 # Periodically prune stale SessionStore entries.  The
                 # in-memory dict (and sessions.json) would otherwise grow
@@ -22508,6 +22586,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     daemon=True,
                     name=f"agent-cache-evict-{key[:24]}",
                 ).start()
+
+    def _sweep_stale_session_ledgers(self) -> int:
+        """Close ledger rows orphaned by sessions that no longer exist.
+
+        Driven by ``_session_expiry_watcher`` (HEL-6658). Fail-open: a sweep
+        failure is counted as a ledger defect in state.db, never raised at the
+        gateway loop.
+        """
+        db = getattr(self, "_session_db", None)
+        db = getattr(db, "_db", None) or db
+        if db is None:
+            return 0
+        try:
+            from hermes_cli.action_ledger import sweep_stale_session_ledgers
+
+            return sweep_stale_session_ledgers(db=db)
+        except Exception as exc:  # pragma: no cover - fail-open by contract
+            logger.debug("Session ledger sweep unavailable: %s", exc)
+            return 0
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.

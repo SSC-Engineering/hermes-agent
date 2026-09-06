@@ -271,6 +271,10 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
             job_title=task.title,
             kanban_task_id=task_id,
             session_id=task.session_id,
+            # A claim row is dispatched work by definition (HEL-6658). The
+            # column is added by a HELIOS-side migration; open_action_ledger
+            # retries without it on older schemas, so behaviour is unchanged.
+            session_kind="dispatched",
         )
         if ledger_id:
             with write_txn(conn):
