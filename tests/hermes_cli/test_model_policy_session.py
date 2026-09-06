@@ -202,6 +202,27 @@ def test_refusal_records_a_closed_policy_refused_row(ledger):
     assert "sess-refused" not in al._TRACKED_SESSIONS
 
 
+def test_refusal_closes_the_sessions_existing_row_not_a_second_one(ledger):
+    """A session refused after its row was opened still has exactly one row."""
+    opened = al.open_session_ledger(
+        "sess-refused-3", "telegram", "cole-espinoza", db=None
+    )
+    assert opened
+
+    closed = al.record_policy_refusal(
+        "sess-refused-3",
+        profile="cole-espinoza",
+        rule_id=mp.RULE_ALLOWLIST,
+        model=FORBIDDEN_RAIL,
+        db=None,
+    )
+
+    assert closed == opened
+    row = ledger.only_row()
+    assert row["outcome"] == al.OUTCOME_POLICY_REFUSED
+    assert "sess-refused-3" not in al._TRACKED_SESSIONS
+
+
 def test_no_secret_material_on_a_policy_refused_row(ledger):
     al.record_policy_refusal(
         "sess-refused-2",
