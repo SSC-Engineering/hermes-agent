@@ -448,6 +448,47 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _apply_nim_rpm_gate(agent) -> None:
+    """Block until the leased NIM key has a free 40 RPM slot.
+
+    No-op unless the agent is a kanban worker AND its runtime hits NVIDIA
+    NIM (``integrate.api.nvidia.com``). See :mod:`agent.nim_governor` for
+    the freeze / bucket / lease primitives. The gate runs in the same
+    thread that issues the HTTP request so it cannot fire ahead of the
+    request it is throttling.
+    """
+    try:
+        from agent.nim_governor import (
+            heartbeat_leased_credential,
+            is_nim_kanban_worker,
+            leased_credential_id,
+            wait_for_rpm_slot,
+        )
+
+        if not is_nim_kanban_worker(agent):
+            return
+        cid = leased_credential_id(agent)
+        if not cid:
+            return
+        # Prove this worker is still alive before we gate. Without a
+        # heartbeat, a worker whose turn outlives ``_LEASE_STALE_SECONDS``
+        # has its own key reclaimed by the next worker to boot, and the two
+        # then share a 40 RPM ceiling — the exact collision HEL-6226 exists
+        # to prevent. Throttled internally to one write per
+        # ``LEASE_HEARTBEAT_INTERVAL_SECONDS``.
+        heartbeat_leased_credential(agent)
+        waited = wait_for_rpm_slot(cid)
+        if waited > 0.5:
+            logger.info(
+                "nim_governor: pre-request gate waited %.1fs for credential %s "
+                "(NVIDIA NIM 40 RPM/key)",
+                waited,
+                cid,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("nim_governor: RPM gate skipped (%s)", exc)
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -464,6 +505,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    _apply_nim_rpm_gate(agent)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -3032,6 +3074,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_request_client = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            _apply_nim_rpm_gate(agent)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,

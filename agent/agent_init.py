@@ -670,6 +670,118 @@ def init_agent(
         except Exception:
             agent._credential_pool = None
 
+    # ── NVIDIA NIM kanban-worker exclusive key lease (HEL-6226) ───────────
+    # NVIDIA NIM free-tier is capped at 40 requests/minute PER API KEY (per
+    # the NVIDIA developer UI, confirmed by Dan on 2026-08-30). Kanban BUILD
+    # bursts (6 workers) share one pool and, without an exclusive claim on
+    # spawn, all six collide on the same key and 429-storm. The delegate-
+    # subagent path (tools/delegate_tool.py) already calls acquire_lease()
+    # per child, but kanban workers spawn as fully independent Popen
+    # subprocesses — so we need a CROSS-PROCESS lease keyed off the
+    # credential id. Handled here (once per agent init) rather than in
+    # cli.py so every entry point that binds a credential pool for a
+    # kanban-worker process gets the exclusive claim automatically.
+    agent._nim_worker_credential_id = None
+    agent._nim_worker_holder_token = None
+    # Timestamp of the last lease heartbeat write. The pre-request RPM gate
+    # refreshes the lease via ``nim_governor.heartbeat_leased_credential``
+    # and throttles on this so a live worker keeps its exclusive claim.
+    agent._nim_lease_heartbeat_at = 0.0
+    try:
+        from agent.nim_governor import (
+            acquire_kanban_worker_lease,
+            is_kanban_worker_process,
+            is_nim_endpoint,
+            is_nim_provider,
+        )
+
+        if (
+            agent._credential_pool is not None
+            and is_kanban_worker_process()
+            and (is_nim_provider(agent.provider) or is_nim_endpoint(agent.base_url))
+        ):
+            _holder = f"pid{os.getpid()}-{time.time_ns()}"
+            _leased = acquire_kanban_worker_lease(
+                agent._credential_pool, holder_token=_holder,
+            )
+            if _leased:
+                agent._nim_worker_credential_id = _leased
+                agent._nim_worker_holder_token = _holder
+                agent._nim_lease_heartbeat_at = time.time()
+                # Register the lease with the in-process pool too so any
+                # sibling delegated child running in this same process reuses
+                # the same accounting.
+                try:
+                    agent._credential_pool.acquire_lease(_leased)
+                except Exception:
+                    pass
+                # Bind the runtime credential to the leased entry so this
+                # worker's HTTP calls actually go through the key we just
+                # reserved. Without this the lease is bookkeeping only: the
+                # caller already resolved an api_key from the pool's own
+                # selection, so every worker would keep issuing requests on
+                # that one key — the exact collision this leaf exists to
+                # prevent.
+                #
+                # Rebind the LOCAL ``api_key``, not ``agent._swap_credential``:
+                # this block runs before the LLM client is constructed, and
+                # ``_swap_credential`` rebuilds a client whose state
+                # (``_client_kwargs`` / ``_anthropic_client``) is only
+                # assigned further down — it would raise AttributeError and
+                # be swallowed. ``api_key`` is what every client-construction
+                # path below reads. ``base_url`` is deliberately left alone:
+                # all NIM sponsor keys share one inference host, and
+                # ``agent._base_url_lower`` / ``_base_url_hostname`` were
+                # already derived from it above.
+                try:
+                    _entries = agent._credential_pool.entries()
+                    _match = next(
+                        (e for e in _entries if getattr(e, "id", None) == _leased),
+                        None,
+                    )
+                except Exception:
+                    _match = None
+                if _match is not None:
+                    _leased_key = (
+                        getattr(_match, "runtime_api_key", None)
+                        or getattr(_match, "access_token", None)
+                        or ""
+                    )
+                    if _leased_key:
+                        api_key = _leased_key
+                        agent.api_key = _leased_key
+                        # Stable attribution for the 429 recovery path, which
+                        # marks/freezes by pool-entry id rather than by the
+                        # mutable key value.
+                        agent._credential_pool_entry_id = _leased
+                import atexit
+                # atexit covers the clean-exit paths (``sys.exit`` from
+                # single-query mode, interactive shutdown, an unhandled
+                # exception unwinding to the interpreter).
+                #
+                # It does NOT cover the kanban worker's forced exit: the
+                # SIGTERM handler in cli.py calls os._exit(128+signum) on
+                # purpose (issue #28181), and os._exit skips atexit. That
+                # path releases the lease explicitly via
+                # ``nim_governor.release_agent_lease`` before exiting, and
+                # the governor's dead-PID stale reclaim is the backstop for
+                # SIGKILL and hard crashes. All three release paths are
+                # idempotent, so overlapping releases are safe.
+                def _release_nim_lease_atexit(cid=_leased, tok=_holder, pool=agent._credential_pool):
+                    try:
+                        from agent.nim_governor import release_kanban_worker_lease
+                        release_kanban_worker_lease(cid, tok)
+                    except Exception:
+                        pass
+                    try:
+                        pool.release_lease(cid)
+                    except Exception:
+                        pass
+                atexit.register(_release_nim_lease_atexit)
+    except Exception:
+        # NIM governor is a policy overlay; never let it break agent init.
+        pass
+
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
     try:

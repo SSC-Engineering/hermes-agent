@@ -1059,6 +1059,68 @@ def recover_with_credential_pool(
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
+        # ── NVIDIA NIM kanban-worker 429 override (HEL-6108 / HEL-6226) ───
+        # Dan 2026-08-30: on the FIRST HTTP 429 for a NIM key in a kanban
+        # worker, freeze the key for 60s and retry ONCE. Do not exp-backoff
+        # storm; do not rotate to another key (the exclusive-lease design
+        # pins this worker to its one key); do not fall through to a paid
+        # provider (nous grok / anthropic / openai). A second consecutive
+        # 429 for the same key hard-fails the turn instead of retrying.
+        try:
+            from agent.nim_governor import (
+                consume_retry_credit,
+                is_nim_kanban_worker,
+                leased_credential_id,
+                record_nim_429,
+            )
+
+            if is_nim_kanban_worker(agent):
+                _nim_cid = leased_credential_id(agent) or _credential_id
+                if _nim_cid:
+                    # First 429 for this key: record freeze, sleep the
+                    # freeze window, return recovered=True so the outer
+                    # loop retries against the SAME key. The one-shot
+                    # retry credit is checked on the second 429 to enforce
+                    # "bounded at ONE wait-and-retry".
+                    if consume_retry_credit(_nim_cid):
+                        _ra().logger.warning(
+                            "NIM kanban worker: second consecutive 429 on "
+                            "credential %s — giving up this turn (Dan "
+                            "2026-08-30 override: no exp-backoff, no paid "
+                            "fallback for NIM 429)",
+                            _nim_cid,
+                        )
+                        # Signal the conversation loop to bail immediately
+                        # rather than drift into jittered backoff. Fallback
+                        # is separately blocked in conversation_loop.py by
+                        # ``is_nim_kanban_worker``, so surfacing api_error
+                        # here does NOT hand the turn off to a paid
+                        # provider — it exits the retry loop on NIM.
+                        agent._nim_no_more_retries = True
+                        return False, True
+                    _freeze_until = record_nim_429(_nim_cid)
+                    _wait = max(0.0, _freeze_until - time.time())
+                    if _wait > 0:
+                        _ra().logger.info(
+                            "NIM kanban worker: freezing credential %s for "
+                            "%.1fs after 429 (single wait-and-retry, no "
+                            "paid fallback per Dan 2026-08-30)",
+                            _nim_cid,
+                            _wait,
+                        )
+                        # Sleep in interruptible increments so a Ctrl-C /
+                        # kanban timeout can still unwind the worker.
+                        _deadline = time.time() + _wait
+                        while time.time() < _deadline:
+                            if getattr(agent, "_interrupt_requested", False):
+                                break
+                            time.sleep(min(1.0, _deadline - time.time()))
+                    return True, True
+        except Exception as _nim_exc:  # pragma: no cover - defensive
+            _ra().logger.debug(
+                "NIM kanban worker 429 override skipped: %s", _nim_exc,
+            )
+
         # If current credential is already marked exhausted, skip retry and
         # rotate immediately. This prevents the "cancel-between-429s" trap
         # where has_retried_429 (a local var) gets reset on each new prompt,

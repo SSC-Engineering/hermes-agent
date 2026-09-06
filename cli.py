@@ -17755,6 +17755,18 @@ def main(
             # previous os._exit(0) collapsed both cases into
             # protocol_violation. 143 is bash's conventional SIGTERM code.
             _forced_rc = 128 + int(signum) if isinstance(signum, int) and signum > 0 else 143
+            # Hand the leased NVIDIA NIM key back before the forced exit
+            # (HEL-6226). ``os._exit`` skips atexit, so without this the key
+            # stays pinned until the governor's dead-PID reclaim grace
+            # elapses — and the dispatcher can respawn this task sooner than
+            # that. One unlink under a file lock, never raises, so it is safe
+            # ahead of the flush deadman below. Stale reclaim remains the
+            # backstop for SIGKILL and hard crashes.
+            try:
+                from agent.nim_governor import release_agent_lease
+                release_agent_lease(getattr(cli, "agent", None))
+            except Exception:
+                pass
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):

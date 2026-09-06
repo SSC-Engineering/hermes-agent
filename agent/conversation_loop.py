@@ -3721,6 +3721,18 @@ def run_conversation(
                 )
                 if recovered_with_pool:
                     continue
+                # NIM kanban-worker bail-out (HEL-6108 override, Dan
+                # 2026-08-30): a second consecutive 429 on the leased NIM
+                # key sets ``_nim_no_more_retries`` — Dan explicitly bounded
+                # NIM 429 recovery at ONE wait-and-retry, so surface the
+                # error immediately instead of drifting into jittered
+                # backoff (still on NIM, since paid fallback is also
+                # blocked). The gateway watchdog / kanban dispatcher will
+                # respawn the worker on the next tick if that's the right
+                # move — the individual turn must not exp-spray.
+                if getattr(agent, "_nim_no_more_retries", False):
+                    agent._nim_no_more_retries = False
+                    raise api_error
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -4279,6 +4291,26 @@ def run_conversation(
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
                 )
+                # NVIDIA NIM kanban-worker override (HEL-6108 / HEL-6226,
+                # Dan 2026-08-30): "Do not engage fallback_model (nous grok,
+                # anthropic, openai) because of NIM 429. BUILD seats must
+                # stay on NIM." The recovery path above (nim_governor
+                # freeze+retry) handles the 429; the fallback chain must not
+                # activate for this class of error even when the primary
+                # pool has no available entries.
+                if _should_fallback:
+                    try:
+                        from agent.nim_governor import is_nim_kanban_worker
+
+                        if is_nim_kanban_worker(agent):
+                            _should_fallback = False
+                            agent._buffer_status(
+                                "⚠️ NIM kanban worker: 429/rate-limit — "
+                                "staying on NIM, no paid fallback "
+                                "(Dan 2026-08-30 override)."
+                            )
+                    except Exception:
+                        pass
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit
