@@ -208,6 +208,30 @@ def test_kanban_worker_session_reuses_the_claim_row(db, ledger, monkeypatch):
     assert row["job_title"] == "Ship the thing"
 
 
+@pytest.mark.real_hal_gate
+def test_kanban_claim_row_is_marked_dispatched(ledger, tmp_path, monkeypatch):
+    """The claim row itself carries session_kind='dispatched'."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _p: True)
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Ship it", body="body", assignee="cole-espinoza"
+        )
+        kb._best_effort_action_ledger_open(conn, task_id)
+
+    row = ledger.only_row()
+    assert row["status"] == "open"
+    assert row["session_kind"] == al.SESSION_KIND_DISPATCHED
+    assert row["kanban_task_id"] == task_id
+    assert row["job_title"] == "Ship it"
+
+
 def test_dispatched_session_without_claim_row_is_marked_dispatched(db, ledger, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_zzz")
     db.create_session("sess-worker-2", "cli", profile_name="cole-espinoza")
