@@ -18,10 +18,20 @@ worker subprocess restarts:
     * **Exclusive key lease** (``acquire_kanban_worker_lease``): when the
       dispatcher spawns a kanban worker whose provider is ``nvidia``, the
       child boot binds itself to a specific pool entry so N workers spread
-      across N keys instead of piling onto the same one. When more workers
-      than keys are alive, the extra workers layer onto the least-leased key
-      (the spawn does not block). Leases are reclaimed when the holder PID
-      is gone or the lease heartbeat is stale.
+      across N keys instead of piling onto the same one. The claim is
+      exclusive up to ``CredentialPool.DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL``
+      (1); only once every key is at that cap do extra workers layer onto
+      the least-leased key (the spawn does not block). Leases are reclaimed
+      after a bounded timeout when the holder dies — ``_LEASE_DEAD_PID_GRACE_SECONDS``
+      once the holder PID is gone, ``_LEASE_STALE_SECONDS`` for a hung or
+      off-host holder — so a killed worker's key returns to the pool with no
+      operator action. Live workers keep their claim by heartbeating from
+      the pre-request RPM gate.
+
+      The lease capacity is exactly ``len(pool.entries())``: adding or
+      retiring a sponsor key with ``hermes auth add/remove nvidia`` changes
+      how many workers get an exclusive key, with no code change here. See
+      ``docs/nvidia-sponsor-key-pool.md``.
     * **40 RPM token bucket** (``wait_for_rpm_slot`` / ``record_nim_request``):
       a rolling-60s request-timestamp log per leased key. If the log already
       has 40 entries in the last 60s, the caller sleeps until the oldest
@@ -79,10 +89,26 @@ NIM_RPM_WINDOW_SECONDS = 60.0
 # never paid fallback on NIM 429."
 NIM_FREEZE_ON_429_SECONDS = 60.0
 
-# Worker leases are refreshed every ~10s by the RPM gate; treat a lease older
-# than this as stale and reclaim it. Set generously above the refresh interval
-# so a briefly-stalled worker isn't kicked mid-turn.
+# Worker leases are refreshed by the pre-request RPM gate (see
+# ``agent.chat_completion_helpers._apply_nim_rpm_gate``, which calls
+# ``refresh_lease_heartbeat`` at most every
+# ``LEASE_HEARTBEAT_INTERVAL_SECONDS``). Treat a lease whose heartbeat is
+# older than ``_LEASE_STALE_SECONDS`` as abandoned and reclaim it. Set
+# generously above the refresh interval so a worker sitting in one long
+# model call isn't kicked mid-turn.
+LEASE_HEARTBEAT_INTERVAL_SECONDS = 10.0
 _LEASE_STALE_SECONDS = 180.0
+
+# Bounded reclaim window for the "worker died" case (HEL-6226). When the
+# holder PID is gone on this host we still wait this long after its last
+# heartbeat before handing the key to someone else. Two reasons for a grace
+# rather than an instant steal: (a) PIDs are recycled, so a just-observed
+# "dead" PID can be a read race against a worker that is mid-exec, and
+# (b) it gives the contract a single number to point at — "a killed worker's
+# key returns to the pool within 15s" — instead of depending on scheduler
+# timing. ``_LEASE_STALE_SECONDS`` remains the backstop for a hung worker
+# whose PID is still alive, and for leases planted by another host.
+_LEASE_DEAD_PID_GRACE_SECONDS = 15.0
 
 # Absolute ceiling on how long the RPM gate will wait for a slot. The bucket
 # never legitimately needs more than 60s + a hair, but this bounds pathological
@@ -232,23 +258,91 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Cross-platform "is this PID still running" check.
+
+    Delegates to :func:`gateway.status._pid_exists`, this repo's single
+    cross-platform implementation (psutil first; ctypes ``OpenProcess`` on
+    Windows; ``/proc`` + ``ps`` zombie detection on POSIX).
+
+    Never use ``os.kill(pid, 0)`` here. On Windows CPython routes ``sig=0``
+    through ``GenerateConsoleCtrlEvent`` and hard-kills the whole console
+    process group (bpo-14484) — i.e. the "just check if it's alive" call
+    would kill the very kanban workers this module only means to observe.
+    ``scripts/check-windows-footguns.py`` blocks that pattern in CI.
+
+    Fails **closed** (returns True) when no backend can answer, so an
+    unreadable process table can never cause a live worker's lease to be
+    stolen. Heartbeat staleness is the bounded backstop for that case.
+    """
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Another user's process — treat as alive; we cannot signal it.
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(int(pid)))
+    except Exception:
+        pass
+    try:
+        import psutil  # type: ignore
+
+        return bool(psutil.pid_exists(int(pid)))
+    except Exception:
+        # Unknown — treat as alive so we never steal a live worker's key.
         return True
-    except OSError:
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
 # Lease selection
 # ---------------------------------------------------------------------------
+
+def pool_is_nim(pool) -> bool:
+    """Whether *pool* is the NVIDIA NIM credential pool.
+
+    True when the pool's provider is ``nvidia`` / ``nvidia-nim``, or when it
+    is a named-custom-endpoint pool whose entries resolve to NIM's inference
+    host (``hermes auth`` lets the sponsor keys be configured either way).
+
+    Pools with no ``provider`` attribute are accepted — lightweight test and
+    plugin adapters expose only ``entries()``, and
+    ``credential_pool_matches_provider`` already treats an unscoped pool as
+    compatible.
+    """
+    if pool is None:
+        return False
+    provider = getattr(pool, "provider", None)
+    if provider is None:
+        return True
+    if is_nim_provider(provider):
+        return True
+    # Named custom endpoint pointed at NIM: judge by where the entries route.
+    try:
+        entries = pool.entries()
+    except Exception:
+        return False
+    urls = []
+    for entry in entries or []:
+        for attr in ("runtime_base_url", "base_url", "inference_base_url"):
+            value = getattr(entry, attr, None)
+            if value:
+                urls.append(value)
+    return bool(urls) and all(is_nim_endpoint(url) for url in urls)
+
+
+def max_concurrent_per_credential() -> int:
+    """Per-credential concurrency cap for the exclusive claim.
+
+    Sourced from ``agent.credential_pool.DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL``
+    (currently 1) rather than re-declared here, so the cross-process kanban
+    lease and the in-process ``CredentialPool.acquire_lease()`` used by
+    ``tools/delegate_tool.py`` can never drift apart.
+    """
+    try:
+        from agent.credential_pool import DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
+
+        return max(1, int(DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL))
+    except Exception:
+        return 1
+
 
 def _iter_lease_files() -> Iterable[Path]:
     try:
@@ -257,42 +351,107 @@ def _iter_lease_files() -> Iterable[Path]:
         return []
 
 
-def _reclaim_stale_leases_locked() -> None:
-    """Drop lease files whose holder is dead or whose heartbeat is stale."""
-    now = time.time()
+def _lease_matches_provider(record: dict, provider: Optional[str]) -> bool:
+    """Whether *record* belongs to *provider*'s pool.
+
+    Lease records written before provider scoping (and records with an empty
+    provider) match every provider — they can only have come from the NIM
+    path, which was the sole writer. ``provider=None`` matches everything.
+    """
+    if not provider:
+        return True
+    recorded = str(record.get("provider") or "").strip().lower()
+    if not recorded:
+        return True
+    return recorded == provider
+
+
+def _reclaim_stale_leases_locked(
+    *,
+    provider: Optional[str] = None,
+    now_fn=time.time,
+    pid_alive_fn=None,
+) -> List[str]:
+    """Drop lease files whose holder died or whose heartbeat went stale.
+
+    Two independent reclaim rules, both bounded (HEL-6226):
+
+    * **Heartbeat stale** — no ``refresh_lease_heartbeat`` in
+      ``_LEASE_STALE_SECONDS``. Covers a hung worker, a SIGSTOPped worker,
+      and any lease planted by a different host (where the PID check below
+      cannot be trusted).
+    * **Holder died** — the holder PID is gone on this host AND its last
+      heartbeat is at least ``_LEASE_DEAD_PID_GRACE_SECONDS`` old. This is
+      the fast path for the common case: a worker is killed, and its key is
+      back in the pool within the grace window instead of being pinned for
+      the full stale timeout.
+
+    Returns the credential ids whose leases were reclaimed (for logging and
+    for tests). ``now_fn`` / ``pid_alive_fn`` are injectable so the reclaim
+    contract can be tested against a fake clock and a fake process table
+    rather than by killing real processes and sleeping.
+    """
+    alive = pid_alive_fn if pid_alive_fn is not None else _pid_alive
+    now = now_fn()
+    reclaimed: List[str] = []
     for path in _iter_lease_files():
         if path.suffix != ".lease":
             continue
         record = _read_json(path)
         if not isinstance(record, dict):
+            # Unparseable state file — nothing can renew it, so it would pin
+            # a key forever. Drop it.
             try:
                 path.unlink()
             except OSError:
                 pass
             continue
+        if not _lease_matches_provider(record, provider):
+            continue
         pid = int(record.get("pid") or 0)
         heartbeat = float(record.get("heartbeat_at") or 0.0)
-        alive_here = pid > 0 and _pid_alive(pid)
-        # Cross-host lease inference is unreliable, so we treat any lease with
-        # a same-host live PID as valid; on other hosts the heartbeat
-        # freshness is the only signal we have.
-        if alive_here and (now - heartbeat) <= _LEASE_STALE_SECONDS:
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        age = now - heartbeat
+        holder_gone = pid <= 0 or not alive(pid)
+        if age > _LEASE_STALE_SECONDS or (
+            holder_gone and age >= _LEASE_DEAD_PID_GRACE_SECONDS
+        ):
+            cid = record.get("credential_id")
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            if isinstance(cid, str) and cid:
+                reclaimed.append(cid)
+            logger.info(
+                "nim_governor: reclaimed lease on credential %s from "
+                "pid=%s task=%s (holder_gone=%s, heartbeat_age=%.1fs)",
+                cid,
+                pid,
+                record.get("kanban_task") or "-",
+                holder_gone,
+                age,
+            )
+    return reclaimed
 
 
-def _current_lease_counts_locked() -> dict:
+def _current_lease_counts_locked(
+    *,
+    provider: Optional[str] = None,
+    now_fn=time.time,
+    pid_alive_fn=None,
+) -> dict:
     """Return {credential_id: active_lease_count} after reclaiming stale leases."""
-    _reclaim_stale_leases_locked()
+    _reclaim_stale_leases_locked(
+        provider=provider, now_fn=now_fn, pid_alive_fn=pid_alive_fn,
+    )
     counts: dict = {}
     for path in _iter_lease_files():
         if path.suffix != ".lease":
             continue
         record = _read_json(path)
         if not isinstance(record, dict):
+            continue
+        if not _lease_matches_provider(record, provider):
             continue
         cid = record.get("credential_id")
         if not isinstance(cid, str) or not cid:
@@ -301,42 +460,92 @@ def _current_lease_counts_locked() -> dict:
     return counts
 
 
+def lease_counts(
+    *,
+    provider: Optional[str] = None,
+    now_fn=time.time,
+    pid_alive_fn=None,
+) -> dict:
+    """Public read of live lease counts: ``{credential_id: holders}``.
+
+    Reclaims stale leases as a side effect (the counts would otherwise be a
+    lie). Used by the HEL-6227 tests and by anyone debugging "why did two
+    workers land on the same key" from a shell.
+    """
+    with _governor_lock():
+        return _current_lease_counts_locked(
+            provider=provider, now_fn=now_fn, pid_alive_fn=pid_alive_fn,
+        )
+
+
 def _lease_path(credential_id: str, holder_token: str) -> Path:
     return _leases_dir() / f"{_safe_id(credential_id)}__{_safe_id(holder_token)}.lease"
 
 
-def _select_least_leased(entry_ids: List[str], counts: dict) -> Optional[str]:
-    """Pick the entry with the fewest active leases; preserve input order on ties."""
+def _select_lease_target(
+    entry_ids: List[str], counts: dict, *, max_concurrent: int,
+) -> Optional[str]:
+    """Pick the credential this worker should claim.
+
+    Exclusive first, layered only as a last resort (HEL-6226):
+
+    1. Prefer any entry **below** ``max_concurrent`` holders — with the pool
+       default of 1 that means an unleased key, so N workers over N keys get
+       N distinct keys and never double-lease.
+    2. Only when *every* entry is at the cap does the worker layer onto the
+       least-leased entry. Spawning must not block just because more workers
+       than keys are alive.
+
+    Ties break on the pool's own entry order (priority-sorted by
+    ``CredentialPool``), so selection is deterministic.
+    """
     if not entry_ids:
         return None
-    ordered = sorted(
-        ((counts.get(cid, 0), idx, cid) for idx, cid in enumerate(entry_ids)),
-        key=lambda item: (item[0], item[1]),
-    )
-    return ordered[0][2]
+    order = {cid: idx for idx, cid in enumerate(entry_ids)}
+    below_cap = [cid for cid in entry_ids if counts.get(cid, 0) < max_concurrent]
+    candidates = below_cap or entry_ids
+    return min(candidates, key=lambda cid: (counts.get(cid, 0), order[cid]))
 
 
-def acquire_kanban_worker_lease(pool, *, holder_token: Optional[str] = None) -> Optional[str]:
-    """Bind this kanban worker to an NVIDIA credential id from *pool*.
+def acquire_kanban_worker_lease(
+    pool,
+    *,
+    holder_token: Optional[str] = None,
+    now_fn=time.time,
+    pid_alive_fn=None,
+) -> Optional[str]:
+    """Bind this kanban worker to an NVIDIA NIM credential id from *pool*.
 
-    Selection order (cross-process, keyed by credential id):
+    Selection order (cross-process, keyed by ``PooledCredential.id`` so it
+    survives worker subprocess restarts):
 
-    1. Reclaim stale leases (dead PID or heartbeat older than
-       ``_LEASE_STALE_SECONDS``).
-    2. Prefer an entry with zero active leases (matches
-       ``CredentialPool.DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1``).
-    3. Fall back to the least-leased entry when every key is already held —
-       spawn must not block forever just because more workers than keys are
-       alive (Dan 2026-08-30).
+    1. Reclaim stale leases — holder PID gone for at least
+       ``_LEASE_DEAD_PID_GRACE_SECONDS``, or heartbeat older than
+       ``_LEASE_STALE_SECONDS``. A killed worker's key is back in the pool
+       without operator action.
+    2. Claim an entry below :func:`max_concurrent_per_credential` (the pool's
+       own ``DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL``, currently 1) — so six
+       workers over six keys take six distinct keys.
+    3. Only when every entry is at the cap, layer onto the least-leased
+       entry. Spawn must never block just because more workers than keys are
+       alive.
 
-    Returns the leased credential id, or ``None`` when the pool has no
-    entries (nothing to lease) or when file locking is unavailable and the
-    caller cannot safely coordinate. The caller must pair each successful
-    acquire with :func:`release_kanban_worker_lease` (an ``atexit`` hook
-    covers the crash-exit case).
+    **Provider-scoped.** Returns ``None`` for any pool that is not the NVIDIA
+    NIM pool (see :func:`pool_is_nim`): this policy exists for one provider's
+    per-key 40 RPM ceiling and must not pin credentials for anyone else.
+    Lease bookkeeping is scoped to the pool's provider too, so a NIM lease
+    can never be counted against — or reclaimed by — another provider's key
+    that happens to share a short ``PooledCredential.id``.
+
+    Also returns ``None`` when the pool has no entries. The caller must pair
+    each successful acquire with :func:`release_kanban_worker_lease` (an
+    ``atexit`` hook covers the crash-exit case).
     """
     if pool is None:
         return None
+    if not pool_is_nim(pool):
+        return None
+    provider_key = str(getattr(pool, "provider", "") or "").strip().lower() or None
     try:
         entries = pool.entries()
     except Exception:
@@ -349,17 +558,23 @@ def acquire_kanban_worker_lease(pool, *, holder_token: Optional[str] = None) -> 
         return None
     token = holder_token or f"pid{os.getpid()}-{time.time_ns()}"
     with _governor_lock():
-        counts = _current_lease_counts_locked()
-        chosen = _select_least_leased(entry_ids, counts)
+        counts = _current_lease_counts_locked(
+            provider=provider_key, now_fn=now_fn, pid_alive_fn=pid_alive_fn,
+        )
+        chosen = _select_lease_target(
+            entry_ids, counts, max_concurrent=max_concurrent_per_credential(),
+        )
         if chosen is None:
             return None
+        now = now_fn()
         record = {
             "credential_id": chosen,
+            "provider": provider_key or "",
             "holder_token": token,
             "pid": os.getpid(),
             "kanban_task": os.environ.get("HERMES_KANBAN_TASK") or "",
-            "acquired_at": time.time(),
-            "heartbeat_at": time.time(),
+            "acquired_at": now,
+            "heartbeat_at": now,
         }
         _write_json_atomic(_lease_path(chosen, token), record)
     logger.info(
@@ -372,17 +587,29 @@ def acquire_kanban_worker_lease(pool, *, holder_token: Optional[str] = None) -> 
     return chosen
 
 
-def refresh_lease_heartbeat(credential_id: str, holder_token: str) -> None:
-    """Bump the heartbeat on this worker's lease so it isn't reclaimed as stale."""
+def refresh_lease_heartbeat(
+    credential_id: str, holder_token: str, *, now_fn=time.time,
+) -> bool:
+    """Bump the heartbeat on this worker's lease so it isn't reclaimed as stale.
+
+    Called from the pre-request RPM gate (at most every
+    ``LEASE_HEARTBEAT_INTERVAL_SECONDS``) — without it, a worker that holds a
+    key for longer than ``_LEASE_STALE_SECONDS`` would have its own key
+    reclaimed out from under it by the next worker to boot.
+
+    Returns True when a lease record was found and refreshed, False when the
+    lease is gone (already reclaimed or released).
+    """
     if not credential_id or not holder_token:
-        return
+        return False
     path = _lease_path(credential_id, holder_token)
     with _governor_lock():
         record = _read_json(path)
         if not isinstance(record, dict):
-            return
-        record["heartbeat_at"] = time.time()
+            return False
+        record["heartbeat_at"] = now_fn()
         _write_json_atomic(path, record)
+        return True
 
 
 def release_kanban_worker_lease(credential_id: str, holder_token: Optional[str] = None) -> None:
@@ -640,3 +867,39 @@ def leased_credential_id(agent) -> Optional[str]:
     if isinstance(cid, str) and cid:
         return cid
     return None
+
+
+def leased_holder_token(agent) -> Optional[str]:
+    """Return the lease holder token this agent registered at init, if any."""
+    token = getattr(agent, "_nim_worker_holder_token", None)
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
+def heartbeat_leased_credential(agent, *, now_fn=time.time) -> None:
+    """Refresh this agent's lease heartbeat, throttled to one write per interval.
+
+    Best-effort and non-raising: a missed heartbeat only risks the lease
+    being reclaimed after ``_LEASE_STALE_SECONDS``, never a failed turn.
+    """
+    cid = leased_credential_id(agent)
+    token = leased_holder_token(agent)
+    if not cid or not token:
+        return
+    now = now_fn()
+    last = getattr(agent, "_nim_lease_heartbeat_at", 0.0) or 0.0
+    try:
+        last = float(last)
+    except (TypeError, ValueError):
+        last = 0.0
+    if (now - last) < LEASE_HEARTBEAT_INTERVAL_SECONDS:
+        return
+    try:
+        agent._nim_lease_heartbeat_at = now
+    except Exception:
+        pass
+    try:
+        refresh_lease_heartbeat(cid, token, now_fn=now_fn)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("nim_governor: heartbeat refresh failed (%s)", exc)

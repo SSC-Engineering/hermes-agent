@@ -683,6 +683,10 @@ def init_agent(
     # kanban-worker process gets the exclusive claim automatically.
     agent._nim_worker_credential_id = None
     agent._nim_worker_holder_token = None
+    # Timestamp of the last lease heartbeat write. The pre-request RPM gate
+    # refreshes the lease via ``nim_governor.heartbeat_leased_credential``
+    # and throttles on this so a live worker keeps its exclusive claim.
+    agent._nim_lease_heartbeat_at = 0.0
     try:
         from agent.nim_governor import (
             acquire_kanban_worker_lease,
@@ -703,6 +707,7 @@ def init_agent(
             if _leased:
                 agent._nim_worker_credential_id = _leased
                 agent._nim_worker_holder_token = _holder
+                agent._nim_lease_heartbeat_at = time.time()
                 # Register the lease with the in-process pool too so any
                 # sibling delegated child running in this same process reuses
                 # the same accounting.

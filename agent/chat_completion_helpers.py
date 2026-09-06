@@ -459,6 +459,7 @@ def _apply_nim_rpm_gate(agent) -> None:
     """
     try:
         from agent.nim_governor import (
+            heartbeat_leased_credential,
             is_nim_kanban_worker,
             leased_credential_id,
             wait_for_rpm_slot,
@@ -469,6 +470,13 @@ def _apply_nim_rpm_gate(agent) -> None:
         cid = leased_credential_id(agent)
         if not cid:
             return
+        # Prove this worker is still alive before we gate. Without a
+        # heartbeat, a worker whose turn outlives ``_LEASE_STALE_SECONDS``
+        # has its own key reclaimed by the next worker to boot, and the two
+        # then share a 40 RPM ceiling — the exact collision HEL-6226 exists
+        # to prevent. Throttled internally to one write per
+        # ``LEASE_HEARTBEAT_INTERVAL_SECONDS``.
+        heartbeat_leased_credential(agent)
         waited = wait_for_rpm_slot(cid)
         if waited > 0.5:
             logger.info(
