@@ -95,12 +95,20 @@ class ModelPolicySessionRefused(ModelPolicyViolation):
 
 
 class PolicyDecision(NamedTuple):
-    """Outcome of a policy screen. ``rule_id`` is set only when denied."""
+    """Outcome of a policy screen. ``rule_id``/``kind`` are set only when denied.
+
+    ``kind`` names which rule was violated ("monitor_ceiling", "allowlist" or
+    "restricted") and is what callers branch on. ``rule_id`` is the manifest
+    citation for the operator, and two rules may legitimately cite the same id
+    (a monitor above its ceiling and an unnamed holder on a restricted tier are
+    both MODEL-003), so it must never be used to tell them apart.
+    """
 
     allowed: bool
     reason: str
     suggested: Optional[str]
     rule_id: Optional[str]
+    kind: Optional[str] = None
 
 
 _cache: dict[str, Any] = {}
@@ -177,6 +185,7 @@ def check(profile: Optional[str], model: Optional[str]) -> PolicyDecision:
                 f"(requested {model})",
                 ceiling,
                 _rule_id(policy, "monitor_ceiling"),
+                "monitor_ceiling",
             )
         return PolicyDecision(True, "monitor at ceiling", None, None)
 
@@ -188,6 +197,7 @@ def check(profile: Optional[str], model: Optional[str]) -> PolicyDecision:
             f"requires HAA approval (add it to {policy.get('__path__') or POLICY_PATH})",
             policy.get("default_model"),
             _rule_id(policy, "allowlist"),
+            "allowlist",
         )
 
     # Rule 3 — restricted tiers are limited to named profiles.
@@ -199,6 +209,7 @@ def check(profile: Optional[str], model: Optional[str]) -> PolicyDecision:
                 f"'{profile}' is not authorised",
                 policy.get("restricted_downgrade") or policy.get("default_model"),
                 _rule_id(policy, "restricted"),
+                "restricted",
             )
 
     return PolicyDecision(True, "allowed", None, None)
@@ -260,7 +271,11 @@ def enforce_session_model(
     rule_id = decision.rule_id or _rule_id(policy, "allowlist")
     allowed = set(policy.get("allowed_models") or [])
 
-    if decision.rule_id == _rule_id(policy, "restricted"):
+    # Branch on the violated rule, never on its citation: MODEL-003 covers both
+    # the monitor ceiling and restricted tiers, and a monitor above its ceiling
+    # must be refused, not moved onto restricted_downgrade (which need not be
+    # at or below that ceiling).
+    if decision.kind == "restricted":
         downgrade = policy.get("restricted_downgrade")
         if downgrade and (not allowed or downgrade in allowed):
             logger.warning(
