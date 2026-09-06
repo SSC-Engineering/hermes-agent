@@ -30,9 +30,11 @@ Rule ids are reported on refusal so an operator can look the rule up.  The
 defaults below are overridable from the policy file's ``rule_ids`` mapping, so
 the manifest stays the source of truth:
 
-  * ``MODEL-006`` — monitor ceiling (nothing that monitors runs above it).
-  * ``MODEL-007`` — the rail must be defined in the allowlist.
-  * ``MODEL-008`` — restricted rails are limited to named holders.
+  * ``MODEL-003`` — tier is a ceiling: a monitor never runs above
+    ``monitor_ceiling`` and a restricted tier is reachable only by its named
+    holders.
+  * ``MODEL-007`` — the rail must be defined in the allowlist (paid frontier
+    providers are prohibited for HELIos seats).
 """
 
 from __future__ import annotations
@@ -55,9 +57,9 @@ POLICY_PATH = os.path.expanduser("~/.hermes/model_policy.yaml")
 # file does not name one.  Local Qwen rail (Constitution 15.3 monitoring floor).
 MONITOR_CEILING = "qwen3.8-engineer"
 
-RULE_MONITOR_CEILING = "MODEL-006"
+RULE_MONITOR_CEILING = "MODEL-003"
 RULE_ALLOWLIST = "MODEL-007"
-RULE_RESTRICTED = "MODEL-008"
+RULE_RESTRICTED = "MODEL-003"
 
 _RULE_ID_KEYS = {
     "monitor_ceiling": RULE_MONITOR_CEILING,
@@ -245,7 +247,7 @@ def enforce_session_model(
     :class:`ModelPolicySessionRefused` when the requested rail is forbidden and
     the policy names no safe rail to fall to.
 
-    A restricted-tier violation (``MODEL-008``) falls to the policy's
+    A restricted-tier violation (``MODEL-003``) falls to the policy's
     ``restricted_downgrade`` when that target is itself on the allowlist; every
     other violation refuses, so a rail that policy has not defined can never be
     reached by starting a session instead of dispatching a job.
