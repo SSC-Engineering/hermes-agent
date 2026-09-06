@@ -1452,6 +1452,19 @@ def _isolate_computer_use_approval_state():
 
 
 @pytest.fixture(autouse=True)
+def _session_ledger_off_by_default(request, monkeypatch):
+    """Default the session ledger OFF so no test opens a live Supabase row.
+
+    ``SessionDB.create_session`` opens an ``action_ledger`` row (HEL-6658) when
+    a HELIOS service role is configured. On a developer machine with
+    ``~/.config/helios/ssc/keys.env`` present that would make every test that
+    creates a session talk to Supabase. Tests that exercise the session ledger
+    set ``HERMES_SESSION_LEDGER=1`` themselves and patch the transport.
+    """
+    monkeypatch.setenv("HERMES_SESSION_LEDGER", "0")
+
+
+@pytest.fixture(autouse=True)
 def _soft_hal_on_kanban_complete(request, monkeypatch):
     """Default HAL close to no-op so hermetic kanban tests never hit Supabase.
 
