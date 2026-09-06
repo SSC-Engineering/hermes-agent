@@ -903,3 +903,44 @@ def heartbeat_leased_credential(agent, *, now_fn=time.time) -> None:
         refresh_lease_heartbeat(cid, token, now_fn=now_fn)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("nim_governor: heartbeat refresh failed (%s)", exc)
+
+
+def release_agent_lease(agent) -> None:
+    """Release the NIM lease *agent* acquired at init, if it holds one.
+
+    Idempotent and non-raising, so every exit path can call it without
+    ordering rules: the attributes are cleared on the way out, a second call
+    is a no-op, and :func:`release_kanban_worker_lease` tolerates a lease
+    file that another process already reclaimed.
+
+    Needed because ``atexit`` is not a complete release path for kanban
+    workers. The dispatcher-spawned worker's SIGTERM handler in ``cli.py``
+    deliberately calls ``os._exit(128+signum)`` (issue #28181 — a controlled
+    unwind leaves the process reparented to init), and ``os._exit`` skips
+    ``atexit`` entirely. Without an explicit release there, a SIGTERMed
+    worker's key stays pinned until the dead-PID reclaim grace elapses. The
+    reclaim is still the backstop for SIGKILL and hard crashes; this makes
+    the common "dispatcher stopped the worker" case return the key at once.
+    """
+    if agent is None:
+        return
+    cid = leased_credential_id(agent)
+    token = leased_holder_token(agent)
+    if not cid:
+        return
+    try:
+        agent._nim_worker_credential_id = None
+        agent._nim_worker_holder_token = None
+    except Exception:
+        pass
+    try:
+        release_kanban_worker_lease(cid, token)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("nim_governor: lease release failed (%s)", exc)
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is not None:
+        try:
+            pool.release_lease(cid)
+        except Exception:
+            pass
+    logger.info("nim_governor: released lease on credential %s", cid)

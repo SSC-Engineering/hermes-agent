@@ -716,23 +716,57 @@ def init_agent(
                 except Exception:
                     pass
                 # Bind the runtime credential to the leased entry so this
-                # worker's HTTP calls go through the key we just reserved.
+                # worker's HTTP calls actually go through the key we just
+                # reserved. Without this the lease is bookkeeping only: the
+                # caller already resolved an api_key from the pool's own
+                # selection, so every worker would keep issuing requests on
+                # that one key — the exact collision this leaf exists to
+                # prevent.
+                #
+                # Rebind the LOCAL ``api_key``, not ``agent._swap_credential``:
+                # this block runs before the LLM client is constructed, and
+                # ``_swap_credential`` rebuilds a client whose state
+                # (``_client_kwargs`` / ``_anthropic_client``) is only
+                # assigned further down — it would raise AttributeError and
+                # be swallowed. ``api_key`` is what every client-construction
+                # path below reads. ``base_url`` is deliberately left alone:
+                # all NIM sponsor keys share one inference host, and
+                # ``agent._base_url_lower`` / ``_base_url_hostname`` were
+                # already derived from it above.
                 try:
                     _entries = agent._credential_pool.entries()
                     _match = next(
                         (e for e in _entries if getattr(e, "id", None) == _leased),
                         None,
                     )
-                    if _match is not None and hasattr(agent, "_swap_credential"):
-                        agent._swap_credential(_match)
                 except Exception:
-                    pass
+                    _match = None
+                if _match is not None:
+                    _leased_key = (
+                        getattr(_match, "runtime_api_key", None)
+                        or getattr(_match, "access_token", None)
+                        or ""
+                    )
+                    if _leased_key:
+                        api_key = _leased_key
+                        agent.api_key = _leased_key
+                        # Stable attribution for the 429 recovery path, which
+                        # marks/freezes by pool-entry id rather than by the
+                        # mutable key value.
+                        agent._credential_pool_entry_id = _leased
                 import atexit
-                # atexit is the fallback release path for crash exits and
-                # kanban's forced os._exit(128+signum) still fires it because
-                # the KanbanWorker signal handler flushes logging before it
-                # exits (cli.py signal handler). release_lease is idempotent
-                # so a double-release from atexit + explicit shutdown is safe.
+                # atexit covers the clean-exit paths (``sys.exit`` from
+                # single-query mode, interactive shutdown, an unhandled
+                # exception unwinding to the interpreter).
+                #
+                # It does NOT cover the kanban worker's forced exit: the
+                # SIGTERM handler in cli.py calls os._exit(128+signum) on
+                # purpose (issue #28181), and os._exit skips atexit. That
+                # path releases the lease explicitly via
+                # ``nim_governor.release_agent_lease`` before exiting, and
+                # the governor's dead-PID stale reclaim is the backstop for
+                # SIGKILL and hard crashes. All three release paths are
+                # idempotent, so overlapping releases are safe.
                 def _release_nim_lease_atexit(cid=_leased, tok=_holder, pool=agent._credential_pool):
                     try:
                         from agent.nim_governor import release_kanban_worker_lease
