@@ -130,6 +130,28 @@ def test_monitor_above_ceiling_is_refused_with_rule_id(tmp_path, monkeypatch):
     assert excinfo.value.rule_id == mp.RULE_MONITOR_CEILING
 
 
+def test_rules_sharing_one_citation_still_behave_differently(tmp_path, monkeypatch):
+    """Two rules may cite the same manifest id; control flow must not conflate them.
+
+    MODEL-003 covers both the monitor ceiling and restricted tiers. A monitor
+    above its ceiling must still be refused, never moved onto
+    restricted_downgrade — that target need not be at or below the ceiling.
+    """
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        name="shared_ids.yaml",
+        rule_ids={"monitor_ceiling": "MODEL-003", "restricted": "MODEL-003"},
+    )
+
+    with pytest.raises(mp.ModelPolicySessionRefused) as excinfo:
+        mp.enforce_session_model("fleet-monitor", RESTRICTED_RAIL)
+    assert excinfo.value.rule_id == "MODEL-003"
+
+    # Same citation, different rule: this one does fall to the safe rail.
+    assert mp.enforce_session_model("cole-espinoza", RESTRICTED_RAIL) == ALLOWED_RAIL
+
+
 def test_rule_ids_are_overridable_from_the_policy_file(tmp_path, monkeypatch):
     _write_policy(
         tmp_path,
