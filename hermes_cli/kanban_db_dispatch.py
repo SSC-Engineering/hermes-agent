@@ -2098,7 +2098,13 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     ]
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
-    for sk in task.skills or ():
+
+    # HAL mandatory: always load helios-activity-ledger for kanban workers so
+    # open/close/assert-visible guidance is in-skill, not only in KANBAN_GUIDANCE.
+    skill_names = [s for s in (task.skills or ()) if s]
+    if "helios-activity-ledger" not in skill_names:
+        skill_names.append("helios-activity-ledger")
+    for sk in skill_names:
         if sk:
             cmd.extend(["--skills", sk])
     if task.model_override:
@@ -2246,6 +2252,37 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Best-effort HAL open at dispatch so NEW work cannot skip ledger visibility.
+    # Session may be empty here; worker still closes with session tokens later.
+    try:
+        from hermes_cli.hal_kanban_enforce import open_on_spawn
+        _hal_id = open_on_spawn(
+            agent=profile_arg,
+            kanban_task_id=task.id,
+            job_title=getattr(task, "title", None) or None,
+            linear=getattr(task, "linear_issue_id", None) or None,
+        )
+        if _hal_id:
+            env["HAL_LEDGER_ID"] = _hal_id
+            env["HERMES_HAL_LEDGER_ID"] = _hal_id
+            # Stamp task when schema supports it (best-effort; never block spawn).
+            try:
+                with contextlib.closing(_kbc.connect(board=board)) as _hconn:
+                    cols = {
+                        r[1]
+                        for r in _hconn.execute("PRAGMA table_info(tasks)").fetchall()
+                    }
+                    if "action_ledger_id" in cols:
+                        _hconn.execute(
+                            "UPDATE tasks SET action_ledger_id = COALESCE(action_ledger_id, ?) WHERE id = ?",
+                            (_hal_id, task.id),
+                        )
+                        _hconn.commit()
+            except Exception:
+                pass
+    except Exception:
+        pass
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)

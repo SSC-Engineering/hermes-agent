@@ -562,6 +562,31 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+
+    # HAL fail-closed gate: refuse kanban_complete without assert-visible.
+    # Auto-closes an open row with session-backed cost when possible; never invents $.
+    try:
+        from hermes_cli.hal_kanban_enforce import assert_visible_or_autoclose
+        import os as _os
+        _profile = _os.environ.get("HERMES_PROFILE")
+        _session = _os.environ.get("HERMES_SESSION_ID")
+        _ok_hal, _hal_detail = assert_visible_or_autoclose(
+            kanban_task_id=tid,
+            profile=_profile,
+            session=_session,
+            agent=_profile,
+            job_title=(getattr(task, "title", None) if task else None),
+        )
+        if not _ok_hal:
+            return tool_error(
+                f"kanban_complete blocked: HAL assert-visible failed for {tid}. "
+                f"{_hal_detail}. Open/close via ~/.hermes/scripts/hal_record.py "
+                f"(skill helios-activity-ledger), then retry kanban_complete. "
+                f"Never invent cost_usd.")
+    except Exception as _hal_exc:  # noqa: BLE001
+        return tool_error(
+            f"kanban_complete blocked: HAL gate error for {tid}: {_hal_exc}. "
+            f"Fix HAL helper/credentials, then retry.")
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
