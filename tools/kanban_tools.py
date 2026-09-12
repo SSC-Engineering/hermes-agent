@@ -666,6 +666,44 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+
+            # HAL assert-visible gate (operator helper path). When
+            # ~/.hermes/scripts/hal_record.py is present, refuse complete unless
+            # assert-visible passes (auto-close with session-backed cost only).
+            # If the helper is absent, fall through to in-repo
+            # ActionLedgerCloseError fail-closed path inside complete_task.
+            try:
+                from pathlib import Path as _HalPath
+                import os as _os
+                _hal_script = _HalPath(
+                    _os.environ.get("HAL_RECORD_SCRIPT")
+                    or str(_HalPath.home() / ".hermes" / "scripts" / "hal_record.py")
+                ).expanduser()
+                if _hal_script.is_file():
+                    from hermes_cli.hal_kanban_enforce import assert_visible_or_autoclose
+                    _task_for_hal = kb.get_task(conn, tid)
+                    _ok_hal, _hal_detail = assert_visible_or_autoclose(
+                        kanban_task_id=tid,
+                        profile=_os.environ.get("HERMES_PROFILE"),
+                        session=_os.environ.get("HERMES_SESSION_ID"),
+                        agent=_os.environ.get("HERMES_PROFILE"),
+                        job_title=(
+                            getattr(_task_for_hal, "title", None) if _task_for_hal else None
+                        ),
+                    )
+                    if not _ok_hal:
+                        return tool_error(
+                            f"kanban_complete blocked: HAL assert-visible failed for {tid}. "
+                            f"{_hal_detail}. Open/close via ~/.hermes/scripts/hal_record.py "
+                            f"(skill helios-activity-ledger), then retry kanban_complete. "
+                            f"Never invent cost_usd."
+                        )
+            except Exception as _hal_exc:  # noqa: BLE001
+                return tool_error(
+                    f"kanban_complete blocked: HAL gate error for {tid}: {_hal_exc}. "
+                    f"Fix HAL helper/credentials, then retry."
+                )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -718,7 +756,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry with metadata.cost_usd from session usage, or "
                     f"ensure worker_session_id is stamped so cost can be "
                     f"resolved automatically. Documented true zero only via "
-                    f"metadata.allow_zero_cost=true."
+                    f"metadata.allow_zero_cost=true. "
+                    f"Operator path: python3 ~/.hermes/scripts/hal_record.py "
+                    f"assert-visible --kanban {tid} (skill helios-activity-ledger)."
                 )
             if not ok:
                 return tool_error(
