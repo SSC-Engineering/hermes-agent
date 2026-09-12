@@ -693,13 +693,14 @@ def test_pid_alive_detects_zombie(kanban_home):
 
 
 
-def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
-    """The dispatcher no longer auto-loads a bundled kanban skill.
+def test_default_spawn_auto_loads_hal_skill_only(kanban_home, monkeypatch):
+    """Default spawn always injects helios-activity-ledger, and only that.
 
-    The kanban lifecycle (formerly the kanban-worker/kanban-orchestrator
-    skills) is now injected into every worker's system prompt via
-    KANBAN_GUIDANCE, so _default_spawn must NOT append a `--skills` flag
-    when the task carries no per-task skills.
+    Kanban lifecycle guidance still lives in KANBAN_GUIDANCE (no bundled
+    kanban-worker/kanban-orchestrator skill), but HAL gospel requires
+    `_default_spawn` to force-load `helios-activity-ledger` even when the
+    task carries no per-task skills. Arbitrary other skills must not be
+    auto-loaded.
 
     We intercept Popen to capture the argv without actually spawning a
     hermes subprocess (which would hang trying to call an LLM).
@@ -729,8 +730,12 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         conn.close()
 
     cmd = captured["cmd"]
-    assert "--skills" not in cmd, (
-        f"spawn argv should not auto-load any skill: {cmd}"
+    # Collect every `--skills` value from argv (pairs: --skills NAME).
+    skill_args = [cmd[i + 1] for i, tok in enumerate(cmd)
+                  if tok == "--skills" and i + 1 < len(cmd)]
+    assert skill_args == ["helios-activity-ledger"], (
+        f"default spawn must auto-load helios-activity-ledger only; "
+        f"got skills={skill_args!r} in argv: {cmd}"
     )
     assert "--accept-hooks" in cmd, f"spawn argv missing --accept-hooks: {cmd}"
     assert cmd.index("--accept-hooks") < cmd.index("chat"), (
