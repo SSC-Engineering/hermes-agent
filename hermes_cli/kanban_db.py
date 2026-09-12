@@ -13052,6 +13052,41 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Best-effort HAL open at dispatch so NEW work cannot skip ledger visibility.
+    # Session may be empty here; worker still closes with session tokens later.
+    # Complements claim-time open via _best_effort_action_ledger_open.
+    try:
+        from hermes_cli.hal_kanban_enforce import open_on_spawn
+        _hal_id = open_on_spawn(
+            agent=profile_arg,
+            kanban_task_id=task.id,
+            job_title=getattr(task, "title", None) or None,
+            linear=getattr(task, "linear_issue_id", None) or None,
+        )
+        if _hal_id:
+            env["HAL_LEDGER_ID"] = _hal_id
+            env["HERMES_HAL_LEDGER_ID"] = _hal_id
+            # Stamp task when schema supports it (best-effort; never block spawn).
+            try:
+                _hconn = connect(board=board)
+                try:
+                    cols = {
+                        r[1]
+                        for r in _hconn.execute("PRAGMA table_info(tasks)").fetchall()
+                    }
+                    if "action_ledger_id" in cols:
+                        with write_txn(_hconn):
+                            _hconn.execute(
+                                "UPDATE tasks SET action_ledger_id = COALESCE(NULLIF(action_ledger_id, ''), ?) WHERE id = ?",
+                                (_hal_id, task.id),
+                            )
+                finally:
+                    _hconn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -13075,10 +13110,15 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    #
+    # HAL mandatory: always load helios-activity-ledger for kanban workers so
+    # open/close/assert-visible guidance is in-skill, not only in KANBAN_GUIDANCE.
+    skill_names = [s for s in (task.skills or ()) if s]
+    if "helios-activity-ledger" not in skill_names:
+        skill_names.append("helios-activity-ledger")
+    for sk in skill_names:
+        if sk:
+            cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker

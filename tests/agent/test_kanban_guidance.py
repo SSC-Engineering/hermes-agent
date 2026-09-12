@@ -80,6 +80,10 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "full-board dump" in prompt
     assert "full-file reads" in prompt
     assert "offset" in prompt and "limit" in prompt
+    # HAL mandatory (2026-09-12)
+    assert "HELIos Activity Ledger" in prompt or "action_ledger" in prompt
+    assert "hal_record.py" in prompt
+    assert "assert-visible" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded():
@@ -88,11 +92,12 @@ def test_kanban_guidance_prompt_size_bounded():
 
     Ceiling allows the reference details folded in when standalone
     kanban-worker / kanban-orchestrator skills were removed, plus the
-    HEL-3137 context-cost discipline section, with a little headroom.
+    HEL-3137 context-cost discipline section, plus the 2026-09-12 HAL mandatory
+    block (action_ledger / hal_record assert-visible), with a little headroom.
     """
     from agent.prompt_builder import KANBAN_GUIDANCE
 
-    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 8_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
