@@ -256,6 +256,12 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
             return
         if getattr(task, "action_ledger_id", None):
             return
+        # Claim precedes worker-session creation. Never attribute that future
+        # attempt to the task creator or a prior worker; completion can late-open
+        # once the current claim has bound its actual runtime identity.
+        _, worker_session = _worker_session_for_hal(conn, task_id, task, {})
+        if not worker_session:
+            return
         linear_id = getattr(task, "linear_issue_id", None) or resolve_task_linear_issue_id(
             conn, task_id, persist=True
         )
@@ -270,7 +276,7 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
             credential_id=None,
             job_title=task.title,
             kanban_task_id=task_id,
-            session_id=task.session_id,
+            session_id=worker_session,
         )
         if ledger_id:
             with write_txn(conn):
@@ -298,51 +304,72 @@ class ActionLedgerCloseError(RuntimeError):
         super().__init__(f"action_ledger close blocked for {task_id}: {reason}")
 
 
+def _bind_current_worker_session_for_hal(conn, task_id, task, row, run_md):
+    """Bind runtime session once, only under the dispatcher's current claim."""
+    sid = (os.environ.get("HERMES_SESSION_ID") or "").strip()
+    claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    run_id = str(row["id"])
+    profile = getattr(task, "assignee", None)
+    if not (sid and claim and profile
+            and os.environ.get("HERMES_KANBAN_TASK") == task_id
+            and os.environ.get("HERMES_KANBAN_RUN_ID") == run_id
+            and os.environ.get("HERMES_PROFILE") == profile
+            and str(getattr(task, "current_run_id", "")) == run_id
+            and getattr(task, "claim_lock", None) == claim):
+        return None
+    stamped = {**run_md, "worker_session_id": sid, "worker_profile": profile}
+    # Compare both the prior metadata and live claim in one write; never replace
+    # another session stamp or let an expired worker bind a successor's run.
+    with write_txn(conn):
+        changed = conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=? AND task_id=? AND metadata IS ? "
+            "AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=? AND assignee=?)",
+            (json.dumps(stamped), row["id"], task_id, row["metadata"],
+             task_id, row["id"], claim, profile),
+        ).rowcount
+    if changed != 1:
+        raise ActionLedgerCloseError(task_id, "attempt ownership changed while binding session")
+    return sid
+
+
 def _worker_session_for_hal(
     conn: sqlite3.Connection,
     task_id: str,
     task: "Task",
     metadata: Optional[dict],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Resolve (profile, session_id) for session-backed HAL cost.
-
-    Prefers completion metadata, then task.session_id, then latest run metadata
-    worker_session_id (stamped by the dispatcher when the worker starts).
-    """
+    """Prefer dispatcher-stamped attempt identity over caller-supplied metadata."""
     md = metadata if isinstance(metadata, dict) else {}
-    session_id = (
-        md.get("session_id")
-        or md.get("worker_session_id")
-        or getattr(task, "session_id", None)
-    )
-    profile = (
-        md.get("profile")
-        or md.get("worker_profile")
-        or getattr(task, "assignee", None)
-    )
-    if session_id and profile:
-        return str(profile), str(session_id)
-
-    # Pull from latest run metadata when the worker stamped it there.
-    try:
-        row = conn.execute(
-            "SELECT metadata FROM task_runs WHERE task_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if row and row["metadata"]:
-            run_md = json.loads(row["metadata"] or "{}")
-            if isinstance(run_md, dict):
-                session_id = session_id or run_md.get("worker_session_id") or run_md.get(
-                    "session_id"
-                )
-                profile = profile or run_md.get("worker_profile") or run_md.get("profile")
-    except Exception:
-        pass
-    return (
-        str(profile) if profile else None,
-        str(session_id) if session_id else None,
-    )
+    run_md = {}
+    row = conn.execute(
+        "SELECT id,metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row and row["metadata"]:
+        try:
+            value = json.loads(row["metadata"])
+            if isinstance(value, dict):
+                run_md = value
+        except (ValueError, TypeError):
+            raise ActionLedgerCloseError(task_id, f"invalid attempt {row['id']} identity metadata")
+    if row:
+        session = str(run_md.get("worker_session_id") or run_md.get("session_id") or "").strip()
+        if not session:
+            session = _bind_current_worker_session_for_hal(conn, task_id, task, row, run_md)
+        if not session:
+            raise ActionLedgerCloseError(task_id, f"attempt {row['id']} session metadata unavailable")
+    else:
+        session = getattr(task, "session_id", None)
+    profile = getattr(task, "assignee", None) or run_md.get("worker_profile") or run_md.get("profile")
+    supplied_session = md.get("session_id") or md.get("worker_session_id")
+    supplied_profile = md.get("profile") or md.get("worker_profile")
+    if session and supplied_session and str(session) != str(supplied_session):
+        raise ActionLedgerCloseError(task_id, "completion session differs from attempt identity")
+    if profile and supplied_profile and str(profile) != str(supplied_profile):
+        raise ActionLedgerCloseError(task_id, "completion profile differs from assigned worker")
+    return (str(profile or supplied_profile) if profile or supplied_profile else None,
+            str(session or supplied_session) if session or supplied_session else None)
 
 
 def _require_action_ledger_close(
