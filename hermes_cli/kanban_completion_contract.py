@@ -22,6 +22,8 @@ def verify_completion_contract(conn, task_id):
         fail('one contract and a workspace are required')
     root = Path(task['workspace_path']).resolve()
     def scoped(raw):
+        if not isinstance(raw, str) or not raw.strip():
+            fail("path must be a nonempty string")
         path = (root / raw).resolve()
         if not path.is_relative_to(root):
             fail('contract paths must stay inside the workspace')
@@ -57,9 +59,14 @@ def verify_completion_contract(conn, task_id):
         path = scoped(artifact['path'])
         if not path.is_file() or path.stat().st_size == 0:
             fail('missing or empty artifact ' + artifact['path'])
-        if artifact.get('json_schema'):
+        if 'json_schema' in artifact:
             from jsonschema import validate, ValidationError, SchemaError
             try:
-                validate(json.loads(path.read_text()), json.loads(scoped(artifact['json_schema']).read_text()))
+                schema = artifact['json_schema']
+                if isinstance(schema, str):
+                    schema = json.loads(scoped(schema).read_text())
+                elif not isinstance(schema, (dict, bool)):
+                    fail('artifact schema must be an object, boolean, or workspace file path')
+                validate(json.loads(path.read_text()), schema)
             except (OSError, ValueError, ValidationError, SchemaError) as exc:
                 fail('artifact schema: ' + str(exc)[:400])
