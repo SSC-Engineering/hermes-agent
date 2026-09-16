@@ -308,7 +308,7 @@ def _worker_session_for_hal(
     md = metadata if isinstance(metadata, dict) else {}
     run_md = {}
     row = conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT id,metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row and row["metadata"]:
@@ -317,9 +317,13 @@ def _worker_session_for_hal(
             if isinstance(value, dict):
                 run_md = value
         except (ValueError, TypeError):
-            raise ActionLedgerCloseError(task_id, "invalid attempt identity metadata")
-    session = (run_md.get("worker_session_id") or run_md.get("session_id")
-               or getattr(task, "session_id", None))
+            raise ActionLedgerCloseError(task_id, f"invalid attempt {row['id']} identity metadata")
+    if row:
+        session = str(run_md.get("worker_session_id") or run_md.get("session_id") or "").strip()
+        if not session:
+            raise ActionLedgerCloseError(task_id, f"attempt {row['id']} session metadata unavailable")
+    else:
+        session = getattr(task, "session_id", None)
     profile = getattr(task, "assignee", None) or run_md.get("worker_profile") or run_md.get("profile")
     supplied_session = md.get("session_id") or md.get("worker_session_id")
     supplied_profile = md.get("profile") or md.get("worker_profile")

@@ -6,6 +6,7 @@ Marked ``real_hal_gate`` so root conftest does not soft-patch the require path.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,8 @@ def test_complete_blocks_when_hal_close_refuses_cost(board, monkeypatch):
                 "UPDATE tasks SET action_ledger_id = ? WHERE id = ?",
                 ("ledger-uuid-gate", tid),
             )
+            conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
+                         (json.dumps({"worker_session_id": "s-gate"}), tid))
         with pytest.raises(kb.ActionLedgerCloseError) as ei:
             kb.complete_task(conn, tid, summary="done without cost")
         assert "cost" in ei.value.reason.lower() or "no cost" in str(ei.value).lower()
@@ -95,6 +98,8 @@ def test_complete_succeeds_when_hal_close_ok(board, monkeypatch):
                 "UPDATE tasks SET action_ledger_id = ? WHERE id = ?",
                 ("ledger-ok", tid),
             )
+            conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
+                         (json.dumps({"worker_session_id": "s-ok"}), tid))
         assert kb.complete_task(
             conn,
             tid,

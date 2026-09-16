@@ -38,6 +38,9 @@ def ledger(monkeypatch):
     ('current',0,'actual','fixture no-spend receipt',True,True),
     ('current',0,'actual','claimed zero',False,False),
     ('current',float('nan'),'actual','invalid',False,False),
+    ('current',0,'unknown','fixture',True,False),
+    ('current','0.05','actual','fixture receipt',False,True),
+    ('current','bad','actual','fixture receipt',False,False),
 ])
 def test_close_preserves_session_and_honest_cost(ledger,session,cost,status,source,allow_zero,accepted):
     kwargs=dict(session_id=session,cost_usd=cost,cost_status=status,pricing_source=source,allow_zero_cost=allow_zero)
@@ -46,7 +49,7 @@ def test_close_preserves_session_and_honest_cost(ledger,session,cost,status,sour
         receipt=dict(ledger)
         assert al.close_action_ledger('ledger',**kwargs)=='ledger'
         assert ledger==receipt  # repeat does not rewrite the original receipt
-        assert ledger['session_id']=='current' and ledger['cost_usd']==cost
+        assert ledger['session_id']=='current' and ledger['cost_usd']==(float(cost) if cost is not None else None)
     else:
         with pytest.raises(al.ActionLedgerError):al.close_action_ledger('ledger',**kwargs)
         assert ledger=={'id':'ledger','session_id':'current','status':'open'}
@@ -84,6 +87,8 @@ def test_kanban_complete_uses_session_bound_http_close(ledger,tmp_path,monkeypat
         assert kb.claim_task(conn,tid,claimer='dispatcher')
         with kb.write_txn(conn):
             conn.execute('UPDATE tasks SET action_ledger_id=?,session_id=? WHERE id=?',('ledger','current',tid))
+            conn.execute('UPDATE task_runs SET metadata=? WHERE task_id=?',
+                         (json.dumps({'worker_session_id':'current'}),tid))
         metadata={'session_id':supplied_session,'cost_status':'unknown','pricing_source':'fixture unpriced'}
         if accepted:
             assert kb.complete_task(conn,tid,summary='fixture completed',metadata=metadata)
@@ -93,3 +98,18 @@ def test_kanban_complete_uses_session_bound_http_close(ledger,tmp_path,monkeypat
             with pytest.raises(kb.ActionLedgerCloseError):kb.complete_task(conn,tid,summary='wrong attempt',metadata=metadata)
             assert kb.get_task(conn,tid).status!='done'
             assert ledger['status']=='open'
+
+@pytest.mark.real_hal_gate
+@pytest.mark.parametrize('run_metadata',[None,'{}','{"worker_session_id":"   "}'])
+def test_existing_attempt_without_session_stamp_never_uses_old_task_session(run_metadata):
+    import sqlite3
+    from types import SimpleNamespace
+    from hermes_cli import kanban_db as kb
+    con=sqlite3.connect(':memory:');con.row_factory=sqlite3.Row
+    con.execute('CREATE TABLE task_runs (id INTEGER, task_id TEXT, metadata TEXT)')
+    con.execute('INSERT INTO task_runs VALUES (7,?,?)',('task',run_metadata))
+    task=SimpleNamespace(session_id='old',assignee='worker')
+    try:
+        with pytest.raises(kb.ActionLedgerCloseError,match='attempt 7.*session'):
+            kb._worker_session_for_hal(con,'task',task,{'session_id':'old'})
+    finally:con.close()
