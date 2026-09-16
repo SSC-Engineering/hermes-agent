@@ -3727,6 +3727,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    from hermes_cli.kanban_assignment_scope import render_assignment_scope
+    lines.extend(render_assignment_scope(task.body, task.workspace_path))
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
