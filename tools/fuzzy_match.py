@@ -308,7 +308,10 @@ def is_already_applied(content: str, old_string: str, new_string: str) -> bool:
     Conservative: new_string non-trivial (>= 8 chars) and present EXACTLY; old_string gone."""
     if not new_string or len(new_string.strip()) < 8 or new_string not in content:
         return False
-    return old_string == new_string or old_string not in content
+    # Identical inputs are an invalid edit, not evidence that a prior edit
+    # landed. Preserve fuzzy_find_and_replace's error at the file-operation
+    # layer; only a changed target whose old text is absent is a repeat.
+    return old_string != new_string and old_string not in content
 
 
 def _matched_regions(content: str, matches: list[Span]) -> str:

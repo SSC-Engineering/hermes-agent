@@ -247,6 +247,29 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
+@pytest.mark.parametrize("same_text", ["unchanged target text", "Composition API with <script setup>"])
+def test_identical_patch_is_not_reported_as_already_applied(tmp_path, same_text):
+    target = tmp_path / "target.txt"
+    target.write_text(same_text)
+    before = target.stat().st_mtime_ns
+    operations = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+    result = operations.patch_replace(str(target), same_text, same_text)
+    assert not result.success
+    assert result.error and "identical" in result.error
+    assert target.read_text() == same_text
+    assert target.stat().st_mtime_ns == before
+
+
+def test_repeated_real_edit_still_reports_already_applied(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("new replacement text")
+    before = target.stat().st_mtime_ns
+    operations = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+    result = operations.patch_replace(str(target), "old target text", "new replacement text")
+    assert result.success and result.no_change
+    assert target.stat().st_mtime_ns == before
+
+
 def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 
