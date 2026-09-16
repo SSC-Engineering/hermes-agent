@@ -159,3 +159,111 @@ def test_worker_tool_binds_only_current_claim_before_http_close(ledger, tmp_path
         assert fresh.status != 'done', response
         assert stamp.get('worker_session_id') is None
         assert ledger['status'] == 'open'
+
+
+@pytest.fixture
+def ledger_store(monkeypatch):
+    """Exercise open and close over HTTP, including session-scoped lookup."""
+    rows = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def respond(self, method):
+            filters = parse_qs(urlparse(self.path).query)
+            matches = [row for row in rows if all(
+                value == ['eq.' + str(row.get(key))]
+                or (value == ['is.null'] and row.get(key) is None)
+                for key, value in filters.items() if key not in {'select', 'limit'}
+            )]
+            if method in {'POST', 'PATCH'}:
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                if method == 'POST':
+                    row = {'id': f'ledger-{len(rows) + 1}', **body}
+                    rows.append(row)
+                    matches = [row]
+                else:
+                    for row in matches:
+                        row.update(body)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(matches).encode())
+
+        def do_GET(self):
+            self.respond('GET')
+
+        def do_POST(self):
+            self.respond('POST')
+
+        def do_PATCH(self):
+            self.respond('PATCH')
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(al, '_service_config', lambda: (
+        f'http://127.0.0.1:{server.server_port}', 'fixture-key'))
+    try:
+        yield rows
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.real_hal_gate
+@pytest.mark.parametrize('origin', [None, 'old-origin'])
+def test_fresh_claim_opens_only_after_worker_identity_exists(ledger_store, tmp_path, monkeypatch, origin):
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists', lambda _: True)
+    monkeypatch.setattr(al, 'require_cost_on_complete', lambda: True)
+    monkeypatch.setattr(al, 'estimate_session_cost', lambda *a: {})
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title='fresh lifecycle', assignee='fixture-worker', session_id=origin)
+        task = kb.claim_task(conn, tid, claimer='dispatcher')
+        assert task is not None
+        assert ledger_store == []  # claim cannot attribute a not-yet-created worker
+        assert kb.get_task(conn, tid).action_ledger_id is None
+
+    for key, value in {
+        'HERMES_KANBAN_TASK': tid, 'HERMES_KANBAN_RUN_ID': str(task.current_run_id),
+        'HERMES_KANBAN_CLAIM_LOCK': task.claim_lock, 'HERMES_PROFILE': 'fixture-worker',
+        'HERMES_SESSION_ID': 'fresh-worker',
+    }.items():
+        monkeypatch.setenv(key, value)
+    response = json.loads(kt._handle_complete({
+        'task_id': tid, 'summary': 'fresh worker finished',
+        'metadata': {'cost_status': 'unknown', 'pricing_source': 'fixture unpriced'},
+    }))
+    with kb.connect() as conn:
+        fresh = kb.get_task(conn, tid)
+        assert fresh.status == 'done', response
+        assert fresh.session_id == origin
+        assert len(ledger_store) == 1
+        assert fresh.action_ledger_id == ledger_store[0]['id']
+    assert ledger_store[0]['session_id'] == 'fresh-worker'
+    assert ledger_store[0]['status'] == 'closed'
+    assert ledger_store[0]['cost_usd'] is None
+
+
+@pytest.mark.parametrize('prior_session', [None, 'earlier-worker'])
+def test_open_does_not_reuse_another_attempts_row(ledger_store, prior_session):
+    prior = {'id': 'prior', 'kanban_task_id': 'task', 'session_id': prior_session, 'status': 'open'}
+    ledger_store.append(dict(prior))
+    args = {'linear_issue_id': None, 'agent_name': 'worker',
+            'kanban_task_id': 'task', 'session_id': 'current-worker'}
+    current = al.open_action_ledger(**args)
+    assert current != 'prior'
+    assert al.open_action_ledger(**args) == current
+    assert ledger_store[0] == prior
+    assert len(ledger_store) == 2

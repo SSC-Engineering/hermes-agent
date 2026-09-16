@@ -378,12 +378,18 @@ def open_action_ledger(
         "kanban_task_id": kanban_task_id,
         "session_id": session_id,
     }
-    # If an open row already exists for this kanban task, reuse it.
+    # Reuse only this attempt's open row. A task can have earlier worker rows
+    # (or an unbound legacy row); neither is safe to retag or close here.
     if kanban_task_id:
         q = urllib.parse.quote(str(kanban_task_id), safe="")
+        session_filter = (
+            "eq." + urllib.parse.quote(str(session_id), safe="")
+            if session_id is not None else "is.null"
+        )
         existing = _request(
             "GET",
-            f"/rest/v1/action_ledger?kanban_task_id=eq.{q}&status=eq.open&select=id&limit=1",
+            f"/rest/v1/action_ledger?kanban_task_id=eq.{q}&session_id={session_filter}"
+            "&status=eq.open&select=id&limit=1",
         )
         if isinstance(existing, list) and existing:
             row_id = existing[0].get("id")

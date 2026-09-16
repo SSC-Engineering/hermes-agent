@@ -256,6 +256,12 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
             return
         if getattr(task, "action_ledger_id", None):
             return
+        # Claim precedes worker-session creation. Never attribute that future
+        # attempt to the task creator or a prior worker; completion can late-open
+        # once the current claim has bound its actual runtime identity.
+        _, worker_session = _worker_session_for_hal(conn, task_id, task, {})
+        if not worker_session:
+            return
         linear_id = getattr(task, "linear_issue_id", None) or resolve_task_linear_issue_id(
             conn, task_id, persist=True
         )
@@ -270,7 +276,7 @@ def _best_effort_action_ledger_open(conn: sqlite3.Connection, task_id: str) -> N
             credential_id=None,
             job_title=task.title,
             kanban_task_id=task_id,
-            session_id=task.session_id,
+            session_id=worker_session,
         )
         if ledger_id:
             with write_txn(conn):
