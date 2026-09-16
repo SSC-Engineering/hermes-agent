@@ -304,45 +304,31 @@ def _worker_session_for_hal(
     task: "Task",
     metadata: Optional[dict],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Resolve (profile, session_id) for session-backed HAL cost.
-
-    Prefers completion metadata, then task.session_id, then latest run metadata
-    worker_session_id (stamped by the dispatcher when the worker starts).
-    """
+    """Prefer dispatcher-stamped attempt identity over caller-supplied metadata."""
     md = metadata if isinstance(metadata, dict) else {}
-    session_id = (
-        md.get("session_id")
-        or md.get("worker_session_id")
-        or getattr(task, "session_id", None)
-    )
-    profile = (
-        md.get("profile")
-        or md.get("worker_profile")
-        or getattr(task, "assignee", None)
-    )
-    if session_id and profile:
-        return str(profile), str(session_id)
-
-    # Pull from latest run metadata when the worker stamped it there.
-    try:
-        row = conn.execute(
-            "SELECT metadata FROM task_runs WHERE task_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if row and row["metadata"]:
-            run_md = json.loads(row["metadata"] or "{}")
-            if isinstance(run_md, dict):
-                session_id = session_id or run_md.get("worker_session_id") or run_md.get(
-                    "session_id"
-                )
-                profile = profile or run_md.get("worker_profile") or run_md.get("profile")
-    except Exception:
-        pass
-    return (
-        str(profile) if profile else None,
-        str(session_id) if session_id else None,
-    )
+    run_md = {}
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row and row["metadata"]:
+        try:
+            value = json.loads(row["metadata"])
+            if isinstance(value, dict):
+                run_md = value
+        except (ValueError, TypeError):
+            raise ActionLedgerCloseError(task_id, "invalid attempt identity metadata")
+    session = (run_md.get("worker_session_id") or run_md.get("session_id")
+               or getattr(task, "session_id", None))
+    profile = getattr(task, "assignee", None) or run_md.get("worker_profile") or run_md.get("profile")
+    supplied_session = md.get("session_id") or md.get("worker_session_id")
+    supplied_profile = md.get("profile") or md.get("worker_profile")
+    if session and supplied_session and str(session) != str(supplied_session):
+        raise ActionLedgerCloseError(task_id, "completion session differs from attempt identity")
+    if profile and supplied_profile and str(profile) != str(supplied_profile):
+        raise ActionLedgerCloseError(task_id, "completion profile differs from assigned worker")
+    return (str(profile or supplied_profile) if profile or supplied_profile else None,
+            str(session or supplied_session) if session or supplied_session else None)
 
 
 def _require_action_ledger_close(

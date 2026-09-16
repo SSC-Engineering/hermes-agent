@@ -67,6 +67,7 @@ def test_close_action_ledger_patches_same_id(monkeypatch):
     monkeypatch.setattr(al, "_request", fake_request)
     out = al.close_action_ledger(
         "uuid-open-1",
+        session_id="s1",
         tools_used=["terminal"],
         skills_used=["helios-agent-cea"],
         llm_model="x-ai/grok-4.5",
@@ -109,9 +110,9 @@ def test_close_completed_allow_zero_cost(monkeypatch):
         return [{"id": "uuid-open-1", "status": "closed"}]
 
     monkeypatch.setattr(al, "_request", fake_request)
-    al.close_action_ledger("uuid-open-1", outcome="completed", allow_zero_cost=True)
+    al.close_action_ledger("uuid-open-1", session_id="s1", outcome="completed", cost_usd=0, allow_zero_cost=True, pricing_source="fixture_no_spend")
     assert calls[0]["cost_usd"] == 0.0
-    assert calls[0]["pricing_source"] == "true_zero_no_spend"
+    assert calls[0]["pricing_source"] == "fixture_no_spend"
 
 
 def test_close_blocked_outcome_allows_null_cost(monkeypatch):
@@ -122,7 +123,7 @@ def test_close_blocked_outcome_allows_null_cost(monkeypatch):
         return [{"id": "uuid-open-1", "status": "closed"}]
 
     monkeypatch.setattr(al, "_request", fake_request)
-    al.close_action_ledger("uuid-open-1", outcome="blocked")
+    al.close_action_ledger("uuid-open-1", session_id="s1", outcome="blocked")
     assert calls[0]["cost_usd"] is None
     assert calls[0]["outcome"] == "blocked"
 
@@ -174,7 +175,7 @@ def test_close_fills_cost_from_session_db(tmp_path, monkeypatch):
     assert calls[0]["cost_usd"] == pytest.approx(0.1234)
     assert calls[0]["prompt_tokens"] == 100
     assert calls[0]["completion_tokens"] == 50
-    assert calls[0]["session_id"] == session_id
+    assert "session_id" not in calls[0]  # existing lineage is matched, never rewritten
     assert calls[0]["pricing_source"] == "session_db"
 
 

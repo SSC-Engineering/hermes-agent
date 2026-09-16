@@ -4,9 +4,9 @@ Opens a row on kanban claim and closes the SAME PK on complete.
 
 Cost discipline (HEL-4156 follow-up):
   * Close prefers session-backed tokens/$ from the worker profile ``state.db``.
-  * A ``completed`` close without cost evidence is refused unless
-    ``allow_zero_cost=True`` (documented true zero only).
-  * ``session_id`` is stamped on close when provided so story rollups keep lineage.
+  * Completed work may retain unknown cost with an explicit pricing source.
+  * Zero cost requires an explicit zero and documented true-zero assertion.
+  * Closure matches the existing session; it never retags another attempt.
 
 Callers that must not crash the kanban state machine catch ``ActionLedgerError``
 and decide fail-open vs fail-closed. HELIos kanban complete is fail-closed when
@@ -22,6 +22,7 @@ Env (loaded from ``~/.config/helios/ssc/keys.env`` when present):
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -419,8 +420,8 @@ def close_action_ledger(
     """UPDATE the SAME open row to closed. Returns the row UUID.
 
     When ``cost_usd`` is missing and ``profile``+``session_id`` are set, fills
-    tokens/$ from the worker session DB. Refuses ``outcome=completed`` with no
-    cost unless ``allow_zero_cost`` (documented true zero only).
+    tokens/$ from the worker session DB. Explicit unknown cost needs a pricing
+    source. Closure requires the existing session and never overwrites a closed row.
     """
     if not ledger_id or not str(ledger_id).strip():
         raise ActionLedgerError("ledger_id is required for close")
@@ -434,7 +435,7 @@ def close_action_ledger(
         est = estimate_session_cost(profile, session_id)
 
     cost = _as_float(cost_usd)
-    if cost is None and est.get("cost_usd") is not None:
+    if cost is None and cost_status != "unknown" and est.get("cost_usd") is not None:
         cost = _as_float(est.get("cost_usd"))
     pt = _as_int(prompt_tokens)
     if pt is None:
@@ -446,17 +447,22 @@ def close_action_ledger(
     c_status = cost_status or est.get("cost_status")
     p_source = pricing_source or est.get("pricing_source")
 
-    if cost is None and oc == "completed":
-        if allow_zero_cost:
-            cost = 0.0
-            c_status = c_status or "estimated"
-            p_source = p_source or "true_zero_no_spend"
-        else:
-            raise ActionLedgerIncompleteError(
-                "action_ledger close refused: no cost evidence for completed "
-                "outcome. Pass cost_usd, profile+session_id with usage, or "
-                "allow_zero_cost for documented true zero."
-            )
+    p_source = str(p_source or "").strip() or None
+    if cost_usd is not None and cost is None:
+        raise ActionLedgerIncompleteError("invalid cost evidence")
+    if cost is not None and (not math.isfinite(cost) or cost < 0):
+        raise ActionLedgerIncompleteError("cost must be finite and nonnegative")
+    if cost == 0 and not (allow_zero_cost and p_source):
+        raise ActionLedgerIncompleteError("zero cost requires documented true-zero evidence")
+    if cost is not None and c_status == "unknown":
+        raise ActionLedgerIncompleteError("unknown cost must remain null")
+    if cost is None and oc == "completed" and not (c_status == "unknown" and p_source):
+        raise ActionLedgerIncompleteError(
+            "completed work requires cost evidence or explicit unknown cost with pricing source"
+        )
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ActionLedgerIncompleteError("session_id is required for close")
 
     body: dict[str, Any] = {
         "status": "closed",
@@ -472,16 +478,26 @@ def close_action_ledger(
         "pricing_source": p_source,
         "signature_md": signature_md,
     }
-    # Lineage: stamp session used for cost so story rollups join cleanly.
-    if session_id:
-        body["session_id"] = str(session_id).strip()
-
+    # Compare-and-set on the original session and open state; never retag lineage.
+    identity = (f"id=eq.{urllib.parse.quote(lid, safe='')}"
+                f"&session_id=eq.{urllib.parse.quote(sid, safe='')}")
     rows = _request(
-        "PATCH",
-        f"/rest/v1/action_ledger?id=eq.{urllib.parse.quote(lid, safe='')}",
-        body=body,
-        prefer="return=representation",
+        "PATCH", f"/rest/v1/action_ledger?{identity}&status=eq.open",
+        body=body, prefer="return=representation",
     )
-    if not isinstance(rows, list) or not rows:
-        raise ActionLedgerError(f"action_ledger close returned no row for {lid}")
-    return str(rows[0].get("id") or lid)
+    if isinstance(rows, list) and rows:
+        return str(rows[0].get("id") or lid)
+    # Repeated completion may observe the same already-closed receipt. Preserve it.
+    rows = _request("GET", f"/rest/v1/action_ledger?{identity}&status=eq.closed&select=id,outcome,cost_usd,cost_status,pricing_source")
+    if isinstance(rows, list) and len(rows) == 1:
+        row = rows[0]
+        recorded = _as_float(row.get("cost_usd"))
+        documented_unknown = (row.get("cost_usd") is None and
+                              row.get("cost_status") == "unknown" and
+                              str(row.get("pricing_source") or "").strip())
+        documented_cost = (recorded is not None and math.isfinite(recorded) and recorded > 0)
+        documented_zero = (recorded == 0 and allow_zero_cost and
+                           str(row.get("pricing_source") or "").strip())
+        if row.get("outcome") == oc and (documented_cost or documented_zero or documented_unknown):
+            return str(row.get("id") or lid)
+    raise ActionLedgerError("ledger missing, session mismatch, or incompatible closed receipt")
