@@ -113,3 +113,49 @@ def test_existing_attempt_without_session_stamp_never_uses_old_task_session(run_
         with pytest.raises(kb.ActionLedgerCloseError,match='attempt 7.*session'):
             kb._worker_session_for_hal(con,'task',task,{'session_id':'old'})
     finally:con.close()
+
+@pytest.mark.real_hal_gate
+@pytest.mark.parametrize('fault', [None, 'run', 'claim', 'profile', 'task'])
+def test_worker_tool_binds_only_current_claim_before_http_close(ledger, tmp_path, monkeypatch, fault):
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists', lambda _: True)
+    monkeypatch.setattr(kb, '_best_effort_action_ledger_open', lambda *a, **kw: None)
+    monkeypatch.setattr(al, 'require_cost_on_complete', lambda: True)
+    monkeypatch.setattr(al, 'estimate_session_cost', lambda *a: {})
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title='worker binding fixture', assignee='fixture-worker')
+        task = kb.claim_task(conn, tid, claimer='dispatcher')
+        assert task is not None
+        with kb.write_txn(conn):
+            conn.execute('UPDATE tasks SET action_ledger_id=?,session_id=? WHERE id=?', ('ledger', 'old-origin', tid))
+        run_id, claim = task.current_run_id, task.claim_lock
+    env = {'HERMES_KANBAN_TASK': tid, 'HERMES_KANBAN_RUN_ID': str(run_id),
+           'HERMES_KANBAN_CLAIM_LOCK': claim, 'HERMES_PROFILE': 'fixture-worker',
+           'HERMES_SESSION_ID': 'current'}
+    key = {'run': 'HERMES_KANBAN_RUN_ID', 'claim': 'HERMES_KANBAN_CLAIM_LOCK',
+           'profile': 'HERMES_PROFILE', 'task': 'HERMES_KANBAN_TASK'}.get(fault)
+    if key:
+        env[key] = 'stale'
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    response = json.loads(kt._handle_complete({'task_id': tid, 'summary': 'fixture result',
+                        'metadata': {'cost_status': 'unknown', 'pricing_source': 'unpriced fixture'}}))
+    with kb.connect() as conn:
+        fresh = kb.get_task(conn, tid)
+        stamp = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()[0] or '{}')
+    if fault is None:
+        assert fresh.status == 'done', response
+        assert stamp['worker_session_id'] == 'current'
+        assert ledger['status'] == 'closed' and ledger['session_id'] == 'current'
+        assert fresh.session_id == 'old-origin'  # task-origin identity not retagged
+    else:
+        assert fresh.status != 'done', response
+        assert stamp.get('worker_session_id') is None
+        assert ledger['status'] == 'open'
