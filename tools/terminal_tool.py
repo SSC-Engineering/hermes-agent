@@ -547,18 +547,29 @@ def _ensure_terminal_env_bridged() -> None:
     if get_terminal_scope() is not None:
         return
     global _terminal_config_bridge_attempted
-    if _terminal_config_bridge_attempted:
-        return
-    _terminal_config_bridge_attempted = True
-    # Never let a config problem take the terminal tool down.
-    with _quiet("terminal config → env fallback bridge failed"):
-        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
+    if not _terminal_config_bridge_attempted:
+        _terminal_config_bridge_attempted = True
+        # Never let a config problem take the terminal tool down.
+        with _quiet("terminal config → env fallback bridge failed"):
+            from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
 
-        raw_config = read_raw_config()
-        if isinstance(raw_config.get("terminal"), dict):
-            apply_terminal_config_to_env(env=None, override=True)
-        elif "TERMINAL_ENV" not in os.environ:
-            apply_terminal_config_to_env(env=None, override=False)
+            raw_config = read_raw_config()
+            if isinstance(raw_config.get("terminal"), dict):
+                apply_terminal_config_to_env(env=None, override=True)
+            elif "TERMINAL_ENV" not in os.environ:
+                apply_terminal_config_to_env(env=None, override=False)
+
+    # The fallback bridge must not replace a local worker's assigned worktree
+    # with the profile default. Keep the runtime carrier consistent for file
+    # path resolution as well as terminal creation; other backends retain their
+    # existing container/remote cwd mapping.
+    if os.environ.get("TERMINAL_ENV", "local") == "local" and (
+        os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_TASK_ID")
+    ):
+        workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
+        if not os.path.isabs(workspace) or not os.path.isdir(workspace):
+            raise ValueError("Invalid local kanban workspace")
+        os.environ["TERMINAL_CWD"] = workspace
 
 
 # Default cwd per backend; anything else (container backends, plugins) is "/root".

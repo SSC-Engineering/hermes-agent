@@ -10,6 +10,15 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Local worker working directory
+
+Local workers use the dispatcher-assigned workspace as the default for terminal
+and relative file operations, even when the profile has a different `terminal.cwd`.
+A missing or invalid assigned directory produces an error instead of redirecting
+writes into the profile directory. Explicit per-tool working directories and
+recorded session directory changes retain their normal behavior. Container and
+remote backends keep their existing path mapping.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
