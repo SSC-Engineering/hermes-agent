@@ -10,7 +10,7 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -76,4 +76,51 @@ def build_kanban_stop_nudge(
     )
 
 
+
+def successful_terminal_in_round(tool_calls, result_messages, task_id, run_id):
+    """Match only fresh, correlated successful results for this worker and run."""
+    import json
+    from agent.message_sanitization import coalesce_tool_call_id
+
+    if not isinstance(task_id, str) or not task_id.strip():
+        return None
+    if isinstance(run_id, bool) or not isinstance(run_id, (int, str)) or not str(run_id).strip():
+        return None
+    task_id, run_id = task_id.strip(), str(run_id).strip()
+    calls, duplicate_ids = {}, set()
+    for call in tool_calls or ():
+        call_id = coalesce_tool_call_id(call)
+        if not call_id:
+            continue
+        if call_id in calls:
+            duplicate_ids.add(call_id)
+        calls[call_id] = _tool_call_name(call)
+    for message in result_messages or ():
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or call_id in duplicate_ids:
+            continue
+        name = calls.get(call_id)
+        if name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        if message.get("name") is not None and message["name"] != name:
+            continue
+        result = message.get("content")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            continue
+        actual_run = result.get("run_id")
+        if isinstance(actual_run, bool) or not isinstance(actual_run, (int, str)):
+            continue
+        if result.get("task_id") == task_id and str(actual_run) == run_id:
+            return name
+    return None
+
 __all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+
+__all__.append("successful_terminal_in_round")

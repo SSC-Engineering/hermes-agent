@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
@@ -149,6 +150,7 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
+    result_start = len(messages)
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
     if getattr(agent, "_incremental_persistence_failed", False):
@@ -173,6 +175,21 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        return _verdict("break")
+
+    # A successful terminal handoff ends this worker before another model call.
+    # Only this batch's persisted results can establish that handoff.
+    from agent.kanban_stop import successful_terminal_in_round
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    terminal = successful_terminal_in_round(
+        assistant_message.tool_calls, messages[result_start:], task_id,
+        os.environ.get("HERMES_KANBAN_RUN_ID"),
+    )
+    if terminal:
+        _turn_exit_reason = "kanban_worker_done"
+        final_response = f"Kanban task {task_id}: {terminal} succeeded."
+        failed = False
+        agent._session_messages = messages
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
