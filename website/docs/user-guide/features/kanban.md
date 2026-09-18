@@ -1009,3 +1009,12 @@ Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file
 ## Design spec
 
 The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.
+
+
+### Finish before the terminal handoff
+
+Write and verify artifacts, publish required status updates, and finish HAL accounting
+before calling a terminal kanban tool. A successful result bound to the current
+worker task and run ends the worker through normal turn finalization; it does not
+request another model summary. Rejected terminal calls remain recoverable.
+Completion is still review-ready evidence, not independent acceptance.
