@@ -1395,21 +1395,92 @@ def _ensure_terminal_env_bridged() -> None:
     bridge or the user's .env made a deliberate choice) this is a no-op.  The
     config bridge only fills the unset case, so it changes an accidental
     default — never an explicit selection.
+
+    After the one-shot bridge decision, ALWAYS re-anchor a local kanban
+    worker to its dispatched workspace (see ``_ensure_kanban_workspace_pinned``
+    below). That step is idempotent and must run every call because the
+    kanban-worker invariant is per-call, not one-shot: an inherited or
+    config-bridged TERMINAL_CWD would silently redirect writes into the wrong
+    checkout (MCP-INC-002 / H2).
     """
     global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
-        return
-    _terminal_config_bridge_attempted = True
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env
+    if not _terminal_config_bridge_attempted and "TERMINAL_ENV" not in os.environ:
+        _terminal_config_bridge_attempted = True
+        try:
+            from hermes_cli.config import apply_terminal_config_to_env
 
-        # env=None targets os.environ inside the helper; override=False keeps
-        # any already-set TERMINAL_* values (e.g. from .env) authoritative.
-        apply_terminal_config_to_env(env=None, override=False)
-    except Exception:
-        # Never let a config problem take the terminal tool down — the
-        # historical local default still applies.
-        logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+            # env=None targets os.environ inside the helper; override=False keeps
+            # any already-set TERMINAL_* values (e.g. from .env) authoritative.
+            apply_terminal_config_to_env(env=None, override=False)
+        except Exception:
+            # Never let a config problem take the terminal tool down — the
+            # historical local default still applies.
+            logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+
+    _ensure_kanban_workspace_pinned()
+
+
+def _ensure_kanban_workspace_pinned() -> None:
+    """Force local kanban workers onto their dispatched worktree (H2 / INC-002).
+
+    The dispatcher pins ``HERMES_KANBAN_WORKSPACE`` on every worker spawn
+    and, when the workspace is a valid absolute directory, also stamps
+    ``TERMINAL_CWD`` to that path. Two things can still drift the local
+    worker's file / terminal cwd off the assigned worktree between spawn
+    and first tool call:
+
+    * The config-fallback bridge above and other startup bridges (gateway /
+      dashboard / TUI) can set ``TERMINAL_CWD`` to a profile default from
+      ``terminal.cwd`` in config.yaml. A worker whose spawn-side stamp was
+      skipped (workspace not yet a real directory at spawn time, or the
+      inherited value looked valid enough to keep) then resolves file paths
+      against the profile default instead of its worktree — writing into
+      the wrong checkout (MCP-INC-002).
+    * A parent gateway process's ``os.environ`` mutation (see
+      ``hermes_cli/main.py::apply_terminal_config_to_env`` at
+      dashboard/serve startup) is copied into the child on spawn, so
+      ``TERMINAL_CWD`` may already point at ``/profile/default`` before the
+      dispatcher's own assignment fires.
+
+    This helper is the single chokepoint that reinforces the invariant on
+    every ``_get_env_config()`` call for LOCAL kanban workers:
+
+    * Refuse to run when ``HERMES_KANBAN_WORKSPACE`` is empty, relative,
+      missing, or a file — fail closed with a stable message rather than
+      silently writing into the wrong tree.
+    * Otherwise, overwrite ``TERMINAL_CWD`` with the assigned workspace
+      even when the parent bridged a stale value in.
+
+    Container / remote / vercel-sandbox backends map their own cwd inside
+    the runtime; this helper only touches the local backend and is a no-op
+    for non-kanban callers.
+    """
+    if os.environ.get("TERMINAL_ENV", "local") != "local":
+        return
+    if not (
+        os.environ.get("HERMES_KANBAN_TASK")
+        or os.environ.get("HERMES_KANBAN_TASK_ID")
+    ):
+        return
+    # A delegate_task child inherits the parent worker's HERMES_KANBAN_* env
+    # but is NOT the dispatcher's run owner — it is a subagent. The
+    # DelegationContext ContextVar (and the process-boundary
+    # HERMES_DELEGATED_CHILD_CONTEXT marker) is exactly the signal that this
+    # code is executing under a subagent, not the worker. The workspace pin
+    # applies to the dispatcher-owned worker only; scrubbing kanban env for
+    # subprocess children is handled by ``scrub_kanban_env`` elsewhere.
+    from agent.delegation_context import is_delegated_child_process_context
+
+    if is_delegated_child_process_context():
+        return
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
+    if (
+        not workspace
+        or not os.path.isabs(workspace)
+        or not os.path.isdir(workspace)
+    ):
+        raise ValueError("Invalid local kanban workspace")
+    os.environ["TERMINAL_CWD"] = workspace
 
 
 def _get_env_config() -> Dict[str, Any]:
