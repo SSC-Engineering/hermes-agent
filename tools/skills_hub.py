@@ -22,6 +22,8 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -118,6 +120,74 @@ def __getattr__(name: str):
     if resolver is not None:
         return resolver()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Read-only inspect guard (H4 / MCP-INC-004)
+# ---------------------------------------------------------------------------
+#
+# ``hermes skills inspect`` and any other "look, don't touch" hub entry point
+# must not touch the filesystem. The historical implementation happily:
+#
+#   * created ``~/.hermes/skills/.hub`` and every subdirectory beneath it
+#     (quarantine, index-cache) via ``ensure_hub_dirs`` calls made from
+#     source-router constructors and adapter fetch paths;
+#   * wrote index-cache entries and the ``.hub/.ignore`` sentinel via
+#     ``_write_index_cache`` while resolving a bundle for preview;
+#   * created ``lock.json`` / ``audit.log`` / ``taps.json`` on first
+#     inspect, even when the user was just previewing an identifier.
+#
+# Any of those effects — even the "harmless" cache seed — silently mutates
+# an inspect target's disk state, so a doctor / operator running a
+# read-only inspect can no longer distinguish "never installed" from
+# "seeded on inspect" (MCP-INC-004 / H4). Fail closed: switch the flag on
+# via ``hub_read_only()`` and every mutation site becomes a no-op (cache
+# writes) or a hard refusal (install / quarantine / lock write).
+
+_HUB_READ_ONLY: ContextVar[bool] = ContextVar(
+    "hermes_hub_read_only",
+    default=False,
+)
+
+
+class HubReadOnlyViolation(RuntimeError):
+    """Attempted a hub mutation while running under ``hub_read_only()``.
+
+    Raised by installer / quarantine / lock / audit paths when they are
+    called during an inspect. Read paths (`_read_index_cache`, source
+    ``inspect`` / ``fetch`` HTTP calls, `HubLockFile.load`) are unaffected.
+    """
+
+
+def is_hub_read_only() -> bool:
+    """Return True while the calling context is under ``hub_read_only()``."""
+    return bool(_HUB_READ_ONLY.get())
+
+
+def _refuse_hub_write(operation: str) -> None:
+    """Guard entry point for a mutating hub op; no-op unless read-only is on."""
+    if _HUB_READ_ONLY.get():
+        raise HubReadOnlyViolation(
+            f"Hub is in read-only inspect mode; refusing to {operation}. "
+            "This is the H4 / MCP-INC-004 fail-closed invariant."
+        )
+
+
+@contextmanager
+def hub_read_only():
+    """Context manager: gate every hub mutation site as a read-only inspect.
+
+    Cache writes (``_write_index_cache``) become no-ops so a preview that
+    calls ``src.fetch(identifier)`` cannot seed the index-cache directory.
+    Installer / quarantine / lock / audit / ``ensure_hub_dirs`` paths raise
+    ``HubReadOnlyViolation`` so any accidental write attempt is loud and
+    the inspect target's disk state is unambiguous afterward.
+    """
+    token = _HUB_READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _HUB_READ_ONLY.reset(token)
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SKILL_FETCH_REDIRECTS = 5
@@ -3262,6 +3332,11 @@ def _read_index_cache(key: str) -> Optional[Any]:
 
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
+    if _HUB_READ_ONLY.get():
+        # H4 / MCP-INC-004: no cache seeding during inspect. A read-only
+        # preview must leave the cache directory untouched so downstream
+        # doctor checks can tell "never queried" from "seeded on inspect".
+        return
     index_cache_dir = _index_cache_dir()
     index_cache_dir.mkdir(parents=True, exist_ok=True)
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
@@ -3314,6 +3389,7 @@ class HubLockFile:
             return {"version": 1, "installed": {}}
 
     def save(self, data: dict) -> None:
+        _refuse_hub_write("mutate hub lock file")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -3389,6 +3465,7 @@ class TapsManager:
             return []
 
     def save(self, taps: List[dict]) -> None:
+        _refuse_hub_write("mutate taps file")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n", encoding="utf-8")
 
@@ -3421,6 +3498,7 @@ class TapsManager:
 def append_audit_log(action: str, skill_name: str, source: str,
                      trust_level: str, verdict: str, extra: str = "") -> None:
     """Append a line to the audit log."""
+    _refuse_hub_write(f"append audit log entry {action!r}")
     audit_log = _audit_log()
     audit_log.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3440,7 +3518,13 @@ def append_audit_log(action: str, skill_name: str, source: str,
 # ---------------------------------------------------------------------------
 
 def ensure_hub_dirs() -> None:
-    """Create the .hub directory structure if it doesn't exist."""
+    """Create the .hub directory structure if it doesn't exist.
+
+    Fails closed under ``hub_read_only()``: a read-only inspect must not
+    seed the hub directory tree, or the inspect target's disk state stops
+    being observable (MCP-INC-004 / H4).
+    """
+    _refuse_hub_write("create hub directory tree")
     hub_dir = _hub_dir()
     lock_file = _lock_file()
     audit_log = _audit_log()
@@ -3458,6 +3542,7 @@ def ensure_hub_dirs() -> None:
 
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
+    _refuse_hub_write("quarantine a bundle")
     ensure_hub_dirs()
     skill_name = _validate_skill_name(bundle.name)
     validated_files: List[Tuple[str, Union[str, bytes]]] = []
@@ -3489,7 +3574,12 @@ def install_from_quarantine(
     scan_result: ScanResult,
     scan_provenance: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Move a scanned skill from quarantine into the skills directory."""
+    """Move a scanned skill from quarantine into the skills directory.
+
+    Refuses (``HubReadOnlyViolation``) under ``hub_read_only()`` — inspect
+    must never mutate the skills tree (H4 / MCP-INC-004).
+    """
+    _refuse_hub_write("install a scanned skill from quarantine")
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
