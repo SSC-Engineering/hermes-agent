@@ -1009,3 +1009,15 @@ Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file
 ## Design spec
 
 The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.
+
+
+### Workspace routing is enforced for local kanban workers
+
+For local backend kanban workers, `TERMINAL_CWD` is re-anchored to the assigned
+`HERMES_KANBAN_WORKSPACE` on every terminal / file tool call, so an inherited
+or config-bridged cwd cannot silently redirect writes into the wrong checkout
+(MCP-INC-002). An invalid workspace assignment fails closed with
+`Invalid local kanban workspace` rather than falling back to a profile
+directory. Container and remote backends map their own cwd inside the runtime
+and are unaffected. `delegate_task` subagents that inherit the parent worker's
+kanban env are exempt (they are not the run owner).
