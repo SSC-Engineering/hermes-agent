@@ -6101,6 +6101,7 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _tool_result_start_idx = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -6133,6 +6134,33 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                # H1 / MCP-INC-036: A kanban worker that just persisted a
+                # successful terminal handoff (kanban_complete / kanban_block)
+                # for its own task+run id must STOP before the next provider
+                # or compression call. Without this, the worker outlives its
+                # card timeout, keeps accruing usage after HAL is closed, and
+                # its post-completion work never gets accounted. Only the
+                # results appended in THIS tool round can match; historical
+                # or unrelated results never fire the guard.
+                from agent.kanban_stop import successful_terminal_in_round
+
+                _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+                _kanban_terminal_name = successful_terminal_in_round(
+                    assistant_message.tool_calls,
+                    messages[_tool_result_start_idx:],
+                    _kanban_task,
+                    os.environ.get("HERMES_KANBAN_RUN_ID"),
+                )
+                if _kanban_terminal_name:
+                    _turn_exit_reason = "kanban_worker_done"
+                    final_response = (
+                        f"Kanban task {_kanban_task}: "
+                        f"{_kanban_terminal_name} succeeded."
+                    )
+                    failed = False
+                    agent._session_messages = messages
                     break
 
                 # Reset per-turn retry counters after successful tool
