@@ -3481,6 +3481,112 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     return dest
 
 
+class SkillNameCollisionError(ValueError):
+    """Installer refused a duplicate logical skill name (H3 / MCP-INC-003).
+
+    Two skill directories claiming the same SKILL.md ``name:`` frontmatter
+    cannot coexist: ``skill_view`` refuses to guess between ambiguous
+    candidates and the slash-command populator drops the second one silently.
+    Landing the collision on disk poisons future preload for both.
+
+    Attributes:
+        skill_name: The colliding logical (frontmatter) name.
+        existing_path: Absolute path to the SKILL.md that already claims it.
+        incoming_path: Absolute path to the incoming SKILL.md the installer
+            was about to move into place. May be inside the quarantine tree.
+    """
+
+    def __init__(
+        self,
+        skill_name: str,
+        existing_path: Path,
+        incoming_path: Path,
+    ) -> None:
+        super().__init__(
+            f"Refusing to install skill: logical name '{skill_name}' already "
+            f"claimed by {existing_path}. Rename the incoming skill's SKILL.md "
+            f"`name:` frontmatter (currently at {incoming_path}) or uninstall "
+            f"the existing one first."
+        )
+        self.skill_name = skill_name
+        self.existing_path = existing_path
+        self.incoming_path = incoming_path
+
+
+def _read_skill_frontmatter_name(skill_md: Path) -> Optional[str]:
+    """Return the SKILL.md ``name:`` frontmatter value, or None on failure."""
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    from agent.skill_utils import parse_frontmatter
+
+    try:
+        frontmatter, _ = parse_frontmatter(content)
+    except Exception:
+        return None
+    value = frontmatter.get("name") if isinstance(frontmatter, dict) else None
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def find_installed_logical_name_owners(
+    skills_root: Optional[Path] = None,
+) -> Dict[str, List[Path]]:
+    """Map ``SKILL.md`` frontmatter ``name:`` → list of directories claiming it.
+
+    Walks the active skills tree (``_skills_dir()`` by default) plus every
+    ``skills.external_dirs`` and returns a mapping from logical name to the
+    absolute SKILL.md paths that declare it. Only names with more than one
+    owner are collisions; the mapping includes single-owner entries so
+    callers can also do lookups for "is this name already claimed?".
+
+    Support directories (references / templates / assets / scripts) are
+    excluded by ``iter_skill_index_files`` and the ``.hub``/``.archive``
+    entries under the skills root are skipped: they must not participate in
+    name resolution.
+    """
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    roots: List[Path] = []
+    active = Path(skills_root) if skills_root is not None else _skills_dir()
+    if active.exists():
+        roots.append(active)
+    try:
+        roots.extend(get_external_skills_dirs())
+    except Exception:
+        # Missing config layer must never take the installer down.
+        pass
+
+    owners: Dict[str, List[Path]] = {}
+    for root in roots:
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            # Skip Hermes-internal metadata directories that share the tree.
+            if any(part in {".git", ".github", ".hub", ".archive"} for part in skill_md.parts):
+                continue
+            name = _read_skill_frontmatter_name(skill_md)
+            if not name:
+                # Fall back to the directory name so a SKILL.md missing an
+                # explicit `name:` still can't be shadowed by a directory
+                # with the same on-disk name (which is how skills without
+                # frontmatter get resolved by skill_view).
+                name = skill_md.parent.name
+            owners.setdefault(name, []).append(skill_md)
+    return owners
+
+
+def find_skill_name_collisions(
+    skills_root: Optional[Path] = None,
+) -> Dict[str, List[Path]]:
+    """Return only the collisions (``len(owners) > 1``) from the owner map."""
+    return {
+        name: paths
+        for name, paths in find_installed_logical_name_owners(skills_root).items()
+        if len(paths) > 1
+    }
+
+
 def install_from_quarantine(
     quarantine_path: Path,
     skill_name: str,
@@ -3489,7 +3595,14 @@ def install_from_quarantine(
     scan_result: ScanResult,
     scan_provenance: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Move a scanned skill from quarantine into the skills directory."""
+    """Move a scanned skill from quarantine into the skills directory.
+
+    Refuses (``SkillNameCollisionError``) when the incoming SKILL.md's
+    logical ``name:`` frontmatter is already claimed by a different skill
+    directory anywhere in the resolved skills tree. Overwriting the same
+    install target (``skills/<category>/<name>``) is still allowed and
+    counts as a re-install of the same logical skill, not a collision.
+    """
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
@@ -3506,6 +3619,32 @@ def install_from_quarantine(
     # symlink-in-skills-tree redirects at install time so the lock entry's
     # path can never refer to a redirected target.
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
+
+    # H3 / MCP-INC-003: refuse to land a second skill directory that claims
+    # the same logical `name:` as an already-installed one. skill_view()
+    # already refuses to guess between ambiguous candidates at resolve time,
+    # so a colliding install would silently disable BOTH skills at preload.
+    # Fail closed at install time instead of shipping the collision to disk.
+    incoming_skill_md = quarantine_resolved / "SKILL.md"
+    incoming_name = _read_skill_frontmatter_name(incoming_skill_md) or safe_skill_name
+    try:
+        install_dir_resolved = install_dir.resolve()
+    except OSError:
+        install_dir_resolved = install_dir
+    for existing_md in find_installed_logical_name_owners().get(incoming_name, []):
+        try:
+            existing_dir = existing_md.parent.resolve()
+        except OSError:
+            existing_dir = existing_md.parent
+        if existing_dir == install_dir_resolved:
+            # Re-install of the same logical skill into its own directory —
+            # not a collision.
+            continue
+        raise SkillNameCollisionError(
+            skill_name=incoming_name,
+            existing_path=existing_md,
+            incoming_path=incoming_skill_md,
+        )
 
     if install_dir.exists():
         shutil.rmtree(install_dir)
