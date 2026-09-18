@@ -806,19 +806,26 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
 
 def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
-    """Preview a skill's SKILL.md content without installing."""
-    from tools.skills_hub import GitHubAuth, create_source_router
+    """Preview a skill's SKILL.md content without installing.
+
+    Runs under ``hub_read_only()`` so a preview never mutates the hub disk
+    state — no cache seed, no ``.hub`` directory creation, no lock or taps
+    write (H4 / MCP-INC-004). Read-only source calls (HTTP fetch, index
+    cache reads) are still allowed.
+    """
+    from tools.skills_hub import GitHubAuth, create_source_router, hub_read_only
 
     c = console or _console
-    auth = GitHubAuth()
-    sources = create_source_router(auth)
+    with hub_read_only():
+        auth = GitHubAuth()
+        sources = create_source_router(auth)
 
-    if "/" not in identifier:
-        identifier = _resolve_short_name(identifier, sources, c)
-        if not identifier:
-            return
+        if "/" not in identifier:
+            identifier = _resolve_short_name(identifier, sources, c)
+            if not identifier:
+                return
 
-    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
+        meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not meta:
         c.print(f"[bold red]Error:[/] Could not find '{identifier}' in any source.\n")
@@ -905,22 +912,28 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
 
 
 def inspect_skill(identifier: str) -> Optional[dict]:
-    """Skill metadata (+ SKILL.md preview) for programmatic callers."""
-    from tools.skills_hub import GitHubAuth, create_source_router
+    """Skill metadata (+ SKILL.md preview) for programmatic callers.
+
+    Runs under ``hub_read_only()`` (H4 / MCP-INC-004) so programmatic
+    inspect from the dashboard / TUI / doctor never mutates the hub disk
+    state either.
+    """
+    from tools.skills_hub import GitHubAuth, create_source_router, hub_read_only
 
     class _Q:
         def print(self, *a, **k):
             pass
 
     c = _Q()
-    auth = GitHubAuth()
-    sources = create_source_router(auth)
-    ident = identifier
-    if "/" not in ident:
-        ident = _resolve_short_name(ident, sources, c)
-        if not ident:
-            return None
-    meta, bundle, _ = _resolve_source_meta_and_bundle(ident, sources)
+    with hub_read_only():
+        auth = GitHubAuth()
+        sources = create_source_router(auth)
+        ident = identifier
+        if "/" not in ident:
+            ident = _resolve_short_name(ident, sources, c)
+            if not ident:
+                return None
+        meta, bundle, _ = _resolve_source_meta_and_bundle(ident, sources)
     if not meta:
         return None
     out: dict = {

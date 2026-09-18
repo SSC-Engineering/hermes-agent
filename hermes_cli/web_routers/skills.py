@@ -249,9 +249,12 @@ async def preview_skill_hub(identifier: str = "", profile: Optional[str] = None)
 
     def _run():
         from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-        from tools.skills_hub import create_source_router
+        from tools.skills_hub import create_source_router, hub_read_only
 
-        with _config_profile_scope(profile):
+        # H4 / MCP-INC-004: preview must never mutate the hub disk state
+        # (no cache seed, no ``.hub`` creation, no lock write) — this is
+        # the dashboard's programmatic inspect entry point.
+        with _config_profile_scope(profile), hub_read_only():
             sources = create_source_router()
             meta, bundle, _src = _resolve_source_meta_and_bundle(ident, sources)
         if not bundle and not meta:
